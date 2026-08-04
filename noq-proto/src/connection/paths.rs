@@ -907,6 +907,12 @@ impl PathResponses {
         Some((response.token, response.network_path))
     }
 
+    /// The network path of the next off-path response, without removing it.
+    pub(crate) fn next_off_path(&self, network_path: FourTuple) -> Option<FourTuple> {
+        let response = self.pending.last()?;
+        (response.network_path != network_path).then_some(response.network_path)
+    }
+
     pub(crate) fn pop_on_path(&mut self, network_path: FourTuple) -> Option<u64> {
         let response = *self.pending.last()?;
         // Using an exact comparison. See explanation in `pop_off_path`.

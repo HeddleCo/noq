@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
@@ -171,6 +171,8 @@ pub struct Connection {
     /// deterministically select the next PathId to send on.
     // TODO(flub): well does it really? But deterministic is nice for now.
     paths: BTreeMap<PathId, PathState>,
+    /// Network paths whose underlying transport cannot currently accept another transmit.
+    transport_blocked_paths: FxHashSet<FourTuple>,
     /// Counter to uniquely identify every [`PathData`] created in this connection.
     ///
     /// Each [`PathData`] gets a [`PathData::generation`] that is unique among all
@@ -373,6 +375,7 @@ impl Connection {
                     prev: None,
                 },
             )]),
+            transport_blocked_paths: FxHashSet::default(),
             path_generation_counter: 0,
             allow_mtud,
             state,
@@ -450,9 +453,65 @@ impl Connection {
     /// - a call was made to `handle_event`
     /// - a call to `poll_transmit` returned `Some`
     /// - a call was made to `handle_timeout`
+    /// - a call was made to `set_path_transport_blocked`
     #[must_use]
     pub fn poll_timeout(&self) -> Option<Instant> {
         self.timers.peek()
+    }
+
+    /// Whether the path's underlying transport is currently marked blocked.
+    fn path_transport_blocked(&self, path_id: PathId) -> bool {
+        self.paths.get(&path_id).is_some_and(|path| {
+            self.transport_blocked_paths
+                .contains(&path.data.network_path)
+        })
+    }
+
+    /// Mark a network path's underlying transport as blocked or writable.
+    ///
+    /// A blocked path is omitted from transmit scheduling and its loss-detection timer is
+    /// paused until the transport accepts the retained transmit; connection-wide and other
+    /// per-path timers continue normally.
+    pub fn set_path_transport_blocked(
+        &mut self,
+        now: Instant,
+        network_path: FourTuple,
+        blocked: bool,
+    ) {
+        if blocked {
+            if !self.transport_blocked_paths.insert(network_path) {
+                return;
+            }
+            let affected = self
+                .paths
+                .iter()
+                .filter_map(|(&path_id, path)| {
+                    (path.data.network_path == network_path).then_some(path_id)
+                })
+                .collect::<Vec<_>>();
+            for path_id in affected {
+                self.timers.stop(
+                    Timer::PerPath(path_id, PathTimer::LossDetection),
+                    self.qlog.with_time(now),
+                );
+            }
+            return;
+        }
+
+        if !self.transport_blocked_paths.remove(&network_path) {
+            return;
+        }
+
+        let affected = self
+            .paths
+            .iter()
+            .filter_map(|(&path_id, path)| {
+                (path.data.network_path == network_path).then_some(path_id)
+            })
+            .collect::<Vec<_>>();
+        for path_id in affected {
+            self.set_loss_detection_timer(now, path_id);
+        }
     }
 
     /// Returns application-facing events
@@ -1084,20 +1143,22 @@ impl Connection {
                 return Some(transmit);
             }
 
-            let info = self.scheduling_info(path_id);
-            if let Some(transmit) = self.poll_transmit_on_path(
-                now,
-                buf,
-                path_id,
-                max_datagrams,
-                &info,
-                connection_close_pending,
-            ) {
-                #[cfg(test)]
-                {
-                    self.partial_stats.transmits_tx += 1;
+            if !self.path_transport_blocked(path_id) {
+                let info = self.scheduling_info(path_id);
+                if let Some(transmit) = self.poll_transmit_on_path(
+                    now,
+                    buf,
+                    path_id,
+                    max_datagrams,
+                    &info,
+                    connection_close_pending,
+                ) {
+                    #[cfg(test)]
+                    {
+                        self.partial_stats.transmits_tx += 1;
+                    }
+                    return Some(transmit);
                 }
-                return Some(transmit);
             }
 
             // Continue checking other paths, tail-loss probes may need to be sent
@@ -1120,7 +1181,9 @@ impl Connection {
             // Try MTU probing now
             let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
             while let Some(path_id) = next_path_id {
-                if let Some(transmit) = self.poll_transmit_mtu_probe(now, buf, path_id) {
+                if !self.path_transport_blocked(path_id)
+                    && let Some(transmit) = self.poll_transmit_mtu_probe(now, buf, path_id)
+                {
                     #[cfg(test)]
                     {
                         self.partial_stats.transmits_tx += 1;
@@ -1979,6 +2042,10 @@ impl Connection {
         buf: &mut Vec<u8>,
         path_id: PathId,
     ) -> Option<Transmit> {
+        let prev_network_path = self.paths.get(&path_id)?.prev.as_ref()?.1.network_path;
+        if self.transport_blocked_paths.contains(&prev_network_path) {
+            return None;
+        }
         let (prev_cid, prev_path) = self.paths.get_mut(&path_id)?.prev.as_mut()?;
         if !prev_path.pending_challenge {
             return None;
@@ -2043,6 +2110,13 @@ impl Connection {
             .paths
             .get_mut(&path_id)
             .map(|state| state.data.network_path)?;
+        let next_network_path = self.spaces[SpaceKind::Data]
+            .for_path(path_id)
+            .pending_path_responses
+            .next_off_path(network_path)?;
+        if self.transport_blocked_paths.contains(&next_network_path) {
+            return None;
+        }
         let cid_queue = self.remote_cids.get_mut(&path_id)?;
         let pns = self.spaces[SpaceKind::Data].for_path(path_id);
         let (token, network_path) = pns.pending_path_responses.pop_off_path(network_path)?;
@@ -2109,6 +2183,13 @@ impl Connection {
         path_id: PathId,
     ) -> Option<Transmit> {
         let remote = self.n0_nat_traversal.next_probe_addr()?;
+
+        if self
+            .transport_blocked_paths
+            .contains(&FourTuple::new(remote.into(), None))
+        {
+            return None;
+        }
 
         if !self.paths.get(&path_id)?.data.validated {
             // Path is not usable for probing
@@ -2783,6 +2864,11 @@ impl Connection {
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self, path_id: PathId) -> Option<Duration> {
         self.path(path_id).map(|d| d.rtt.get())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn min_rtt(&self, path_id: PathId) -> Option<Duration> {
+        self.path(path_id).map(|d| d.rtt.min())
     }
 
     /// Current state of this connection's congestion controller, for debugging purposes
@@ -3684,6 +3770,14 @@ impl Connection {
             // No loss detection takes place on closed connections, and `close_common` already
             // stopped time timer. Ensure we don't restart it inadvertently, e.g. in response to a
             // reordered packet being handled by state-insensitive code.
+            return;
+        }
+
+        if self.path_transport_blocked(path_id) {
+            self.timers.stop(
+                Timer::PerPath(path_id, PathTimer::LossDetection),
+                self.qlog.with_time(now),
+            );
             return;
         }
 
