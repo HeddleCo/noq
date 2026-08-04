@@ -14,6 +14,7 @@ use frame::StreamMetaVec;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
+use tinyvec::TinyVec;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
@@ -117,6 +118,34 @@ use state::State;
 pub use state::State;
 use state::StateType;
 
+#[derive(Clone, Copy, Debug)]
+struct BuiltPacket {
+    space: SpaceId,
+    packet_number: u64,
+}
+
+impl Default for BuiltPacket {
+    fn default() -> Self {
+        Self {
+            space: SpaceId::Initial,
+            packet_number: 0,
+        }
+    }
+}
+
+/// Inline capacity for [`BuiltTransmit::packets`].
+///
+/// The runtime caps a transmit at 10 GSO segments (`MAX_TRANSMIT_SEGMENTS` in `noq`) and a
+/// datagram can additionally coalesce packets from multiple spaces during the handshake.
+/// Larger batches spill to the heap.
+const BUILT_PACKETS_INLINE: usize = 12;
+
+#[derive(Debug)]
+struct BuiltTransmit {
+    path_id: PathId,
+    packets: TinyVec<[BuiltPacket; BUILT_PACKETS_INLINE]>,
+}
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -173,6 +202,14 @@ pub struct Connection {
     paths: BTreeMap<PathId, PathState>,
     /// Network paths whose underlying transport cannot currently accept another transmit.
     transport_blocked_paths: FxHashSet<FourTuple>,
+    /// Packet numbers encoded into the most recently returned transmit, with its network path.
+    ///
+    /// `poll_transmit` builds at most one transmit per call, and the runtime reports transport
+    /// blockage before polling another transmit for the same network path, so a single record
+    /// bridging packet construction and that send attempt suffices.
+    last_built_transmit: Option<(FourTuple, BuiltTransmit)>,
+    /// Packet numbers in the encoded transmit retained by the runtime for each blocked path.
+    held_transmits: FxHashMap<FourTuple, BuiltTransmit>,
     /// Counter to uniquely identify every [`PathData`] created in this connection.
     ///
     /// Each [`PathData`] gets a [`PathData::generation`] that is unique among all
@@ -376,6 +413,8 @@ impl Connection {
                 },
             )]),
             transport_blocked_paths: FxHashSet::default(),
+            last_built_transmit: None,
+            held_transmits: FxHashMap::default(),
             path_generation_counter: 0,
             allow_mtud,
             state,
@@ -469,9 +508,9 @@ impl Connection {
 
     /// Mark a network path's underlying transport as blocked or writable.
     ///
-    /// A blocked path is omitted from transmit scheduling and its loss-detection timer is
-    /// paused until the transport accepts the retained transmit; connection-wide and other
-    /// per-path timers continue normally.
+    /// A blocked path is omitted from transmit scheduling. Loss detection for an on-path
+    /// transmit is paused until the exact encoded transmit has been accepted by the transport;
+    /// connection-wide and other per-path timers continue normally.
     pub fn set_path_transport_blocked(
         &mut self,
         now: Instant,
@@ -481,6 +520,15 @@ impl Connection {
         if blocked {
             if !self.transport_blocked_paths.insert(network_path) {
                 return;
+            }
+            if let Some((_, held)) = self
+                .last_built_transmit
+                .take_if(|(recorded, _)| *recorded == network_path)
+            {
+                debug_assert!(
+                    self.held_transmits.insert(network_path, held).is_none(),
+                    "newly blocked network path already had a held transmit"
+                );
             }
             let affected = self
                 .paths
@@ -502,14 +550,38 @@ impl Connection {
             return;
         }
 
-        let affected = self
+        let held = self.held_transmits.remove(&network_path);
+        let mut affected = self
             .paths
             .iter()
             .filter_map(|(&path_id, path)| {
                 (path.data.network_path == network_path).then_some(path_id)
             })
             .collect::<Vec<_>>();
+
+        if let Some(held) = held {
+            if !affected.contains(&held.path_id) && self.paths.contains_key(&held.path_id) {
+                affected.push(held.path_id);
+            }
+            for built in held.packets {
+                let Some(pns) = self.spaces[built.space].path_space_mut(held.path_id) else {
+                    continue;
+                };
+                let latest_ack_eliciting = pns.largest_ack_eliciting_sent == built.packet_number;
+                let Some(mut packet) = pns.sent_packets.remove(built.packet_number) else {
+                    continue;
+                };
+                packet.time_sent = now;
+                if packet.ack_eliciting && latest_ack_eliciting {
+                    pns.time_of_last_ack_eliciting_packet = Some(now);
+                }
+                pns.sent_packets.insert(built.packet_number, packet);
+                pns.loss_time = None;
+            }
+        }
+
         for path_id in affected {
+            self.recompute_loss_time(now, path_id);
             self.set_loss_detection_timer(now, path_id);
         }
     }
@@ -1085,6 +1157,11 @@ impl Connection {
         max_datagrams: NonZeroUsize,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
+        // A transport-blocked result is reported immediately after the transmit is returned. Any
+        // older unpromoted record therefore belongs to a transmit which was accepted or handled
+        // with sender-wide backpressure and must not be associated with this call's result.
+        self.last_built_transmit = None;
+
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => NonZeroUsize::MIN,
             true => max_datagrams,
@@ -1331,6 +1408,29 @@ impl Connection {
             },
             src_ip: network_path.local_ip,
         }
+    }
+
+    fn record_built_packet(&mut self, path_id: PathId, space: SpaceId, packet_number: u64) {
+        if self.last_built_transmit.is_none() {
+            let network_path = self.path_data(path_id).network_path;
+            self.last_built_transmit = Some((
+                network_path,
+                BuiltTransmit {
+                    path_id,
+                    packets: TinyVec::new(),
+                },
+            ));
+        }
+        debug_assert_eq!(
+            self.last_built_transmit.as_ref().map(|(path, _)| *path),
+            Some(self.path_data(path_id).network_path),
+        );
+        let (_, built) = self.last_built_transmit.as_mut().expect("recorded above");
+        debug_assert_eq!(built.path_id, path_id);
+        built.packets.push(BuiltPacket {
+            space,
+            packet_number,
+        });
     }
 
     /// poll_transmit logic for off-path data.
@@ -3632,6 +3732,39 @@ impl Connection {
                     .map(|time| (time, id))
             })
             .min_by_key(|&(time, _)| time)
+    }
+
+    /// Recompute time-threshold loss deadlines after held packet timestamps have changed.
+    fn recompute_loss_time(&mut self, now: Instant, path_id: PathId) {
+        let Some(path) = self.path(path_id) else {
+            return;
+        };
+        let loss_delay = path
+            .rtt
+            .conservative()
+            .mul_f32(self.config.time_threshold)
+            .max(TIMER_GRANULARITY);
+        let packet_threshold = self.config.packet_threshold as u64;
+
+        for space in &mut self.spaces {
+            let Some(pns) = space.path_space_mut(path_id) else {
+                continue;
+            };
+            pns.loss_time = pns.largest_acked_packet_pn.and_then(|largest_acked| {
+                pns.sent_packets
+                    .iter_range(0..largest_acked)
+                    .map(|(packet_number, packet)| {
+                        if largest_acked.saturating_sub(packet_number) >= packet_threshold
+                            || now.saturating_duration_since(packet.time_sent) >= loss_delay
+                        {
+                            now
+                        } else {
+                            packet.time_sent + loss_delay
+                        }
+                    })
+                    .min()
+            });
+        }
     }
 
     /// Returns the earliest next PTO should fire for all spaces on a path.

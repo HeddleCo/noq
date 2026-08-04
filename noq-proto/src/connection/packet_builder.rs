@@ -302,6 +302,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             packet,
             conn.spaces[space_id].for_path(path_id),
         );
+        conn.record_built_packet(path_id, space_id, packet_number);
         conn.reset_keep_alive(path_id, now);
         if size != 0 {
             if ack_eliciting {
