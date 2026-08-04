@@ -46,27 +46,27 @@ the same retained transmit once, but cannot allocate another one or spin.
 
 ## Packet accounting, pacing, and timers
 
-`Connection::poll_transmit` commits packet numbers, stream ranges, congestion accounting, pacing
-tokens, and sent-packet metadata while encoding. Moving that mutation to an I/O completion
-callback would be a much larger protocol refactor, so a retained transmit keeps its encode-time
-accounting and is sent exactly once. This matches noq's existing behavior for sender-wide
-backpressure: when a plain UDP socket returns `Pending`, the driver already buffers the encoded
-transmit and retries it later without touching timestamps.
+`Connection::poll_transmit` historically commits packet numbers, stream ranges, congestion
+accounting, pacing tokens, and sent-packet metadata while encoding. Moving all of that mutation to
+an I/O completion callback would be a much larger protocol refactor. This increment therefore
+retains the encoded datagram and commits to sending those bytes exactly once.
 
-While a 4-tuple is transport-blocked, its paths' loss-detection timers are stopped: no
-retransmission can make progress into a blocked transport, and letting the PTO fire would only
-inflate the backoff counter. On unblock the timers are re-armed from the unmodified sent-packet
-state.
+That choice needs special loss-timer handling because the encoded packet is not yet on the wire.
+As `poll_transmit` finalizes tracked packets, proto records the exact path ID, packet-number space,
+and packet number encoded into the returned transmit. This includes every packet in a coalesced or
+GSO batch. If the runtime reports `WouldBlock`, that small last-built record is promoted to a held
+set keyed by the transmit's 4-tuple, and proto stops loss detection for paths using that transport.
+Repeated blocked retries leave the held set unchanged. Off-path validation and NAT-traversal
+packets do not create such a record because they are not tracked by congestion or loss recovery.
 
-Because timestamps are not modified, the consequences of a block longer than the loss/PTO
-deadlines are the same as for a long sender-wide block today: the retained packet's eventual RTT
-sample is inflated by the local wait (inflated samples cannot corrupt `min_rtt`, which is a
-monotone minimum), and re-arming after a long block may fire an immediate loss timeout or probe
-for the retained packet, producing a benign duplicate. For kernel UDP sockets such blocks last
-microseconds and this never matters. Transports that block for tens of milliseconds or more may
-justify rebasing the retained packets' timestamps to the transport-acceptance time; that is
-deliberately left as a follow-up increment ("precise held-packet rebase") so this core stays
-small.
+On transport acceptance, proto rebases only the held packet entries to the acceptance time. A
+missing entry is skipped defensively. The last ack-eliciting send time changes only when the held
+set contains that packet-number space's latest ack-eliciting packet. Proto then recomputes derived
+time-threshold loss state from the mixture of rebased held timestamps and original wire timestamps,
+and re-arms loss detection. This prevents local queue time from causing loss or PTO for the retained
+bytes without corrupting RTT samples for packets which were already on the wire. If a wire packet
+remained unacknowledged throughout a long block, an immediate loss timeout or PTO after unblock is
+correct: it may genuinely be lost, and the path can now send a probe.
 
 Pacing state remains intact. Once writable, the retained datagram is sent first and later packets
 are still subject to the existing congestion window and pacer. Loss, pacing, ACK, keepalive, path
@@ -75,14 +75,23 @@ path idle timers are deliberately not suspended, so an indefinitely blocked conn
 observes its negotiated liveness limits.
 
 Off-path path-validation and NAT-traversal packets are encoded without congestion/loss tracking in
-the existing implementation. They are still retained and suppressed by exact 4-tuple, but need no
-loss-timer handling.
+the existing implementation. They are still retained and suppressed by exact 4-tuple, but do not
+need loss-timer rebasing.
 
 ## Performance
 
-Nothing runs on the unblocked hot path except membership checks against an empty
-`FxHashSet<FourTuple>` when scheduling transmits and arming loss timers. All other logic runs
-only while a path is blocked or at the block/unblock transitions.
+The only cost on the unblocked hot path is recording built packet numbers: per packet, one
+`Option` check plus a push into an inline-capacity `TinyVec` held in a single-slot record
+(`poll_transmit` builds at most one transmit per call, so no map is involved); per
+`poll_transmit`, one `Option` reset. Everything else runs only while a path is blocked or at the
+block/unblock transitions.
+
+Measured with `bench/bulk` defaults (1 GiB, single stream, localhost) on an Apple Silicon
+laptop, five alternating branch/main pairs on an otherwise idle machine: per-pair deltas of
++0.7%, -6.2%, -1.8%, +1.8%, +0.6% (branch relative to main), while main's own run-to-run spread
+across the session was ~10% (157-173 MiB/s). No regression is distinguishable from machine
+variance at this benchmark's sensitivity; the repository's CI perf report is the authoritative
+check.
 
 ## Endpoint-generated packets
 
@@ -126,11 +135,12 @@ semantics established here.
 
 ## Open questions and follow-ups
 
-- The precise held-packet rebase described above: track the packet numbers encoded into the
-  retained transmit and rebase exactly those to the transport-acceptance time on unblock, making
-  their RTT samples correct and eliminating the post-block duplicate for slow transports.
 - A future transport identity should likely be an opaque stable key rather than a `FourTuple`,
   especially across migration or when multiple logical transports can serve one destination.
+- Precise held-set rebasing resolves the earlier coarse recovery-pause and RTT-skew concern: wire
+  packets retain their true send times, while only locally held packets move to the acceptance
+  time. A future encode/commit split could remove held-set tracking entirely by committing packet
+  accounting only after transport acceptance.
 - A first-class transport scheduler could expose independent `max_transmit_segments`, MTU,
   congestion policy, and readiness registration, subsuming sibling work tracked alongside #403.
 - If muxes need more than one connection task waiting on independently writable destinations, the
