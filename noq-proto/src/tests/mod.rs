@@ -2139,6 +2139,59 @@ fn transport_unblock_wire_min_rtt() -> TestResult {
 }
 
 #[test]
+fn transport_unblock_held_rtt() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .with_latency(Duration::from_millis(50))
+        .disable_mtud_discovery()
+        .connect();
+    let network_path = pair.network_path(Client, PathId::ZERO)?;
+    let min_rtt_before = pair.conn(Client).min_rtt(PathId::ZERO).unwrap();
+    let lost_before = pair.path_stats(Client, PathId::ZERO).unwrap().lost_packets;
+
+    // Build a GSO batch, then hold it locally for much longer than the established RTT.
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(&[0x5a; 8_000])?;
+    pair.send_stream(Client, stream).finish()?;
+    let mut buffer = Vec::new();
+    let transmit = pair
+        .poll_transmit(
+            Client,
+            std::num::NonZeroUsize::new(10).unwrap(),
+            &mut buffer,
+        )
+        .expect("stream data should produce a transmit");
+    let segments = util::split_transmit(transmit, &buffer);
+    assert!(segments.len() > 1, "test requires a GSO batch");
+
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .set_path_transport_blocked(now, network_path, true);
+    pair.time += Duration::from_secs(1);
+    // Once accepted, use a faster link so a correctly rebased sample becomes the new
+    // minimum; measuring any packet in the batch from encode time would not.
+    pair.routes.set_latency(Duration::from_millis(1));
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .set_path_transport_blocked(now, network_path, false);
+    pair.client.outbound.extend(segments);
+    pair.drive();
+
+    let min_rtt_after = pair.conn(Client).min_rtt(PathId::ZERO).unwrap();
+    assert!(
+        min_rtt_after < min_rtt_before / 2,
+        "held packet RTT included its local wait: {min_rtt_after:?} (was {min_rtt_before:?})"
+    );
+    assert_eq!(
+        pair.path_stats(Client, PathId::ZERO).unwrap().lost_packets,
+        lost_before,
+        "a packet in the retained GSO batch used its encode timestamp"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn handshake_1rtt_handling() {
     let _guard = subscribe();
     let mut pair = Pair::default();
