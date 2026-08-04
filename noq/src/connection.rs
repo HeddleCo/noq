@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     future::Future,
     io,
@@ -1472,13 +1473,25 @@ pub(crate) struct State {
     sender: Pin<Box<dyn UdpSender>>,
     pub(crate) runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
-    /// We buffer a transmit when the underlying I/O would block
-    buffered_transmit: Option<proto::Transmit>,
+    /// Encoded transmits retained while their underlying transport is blocked.
+    ///
+    /// There can be at most one entry for any network path because proto stops scheduling a path
+    /// as soon as its first blocked transmit is retained.
+    buffered_transmits: VecDeque<BufferedTransmit>,
     /// Our last external address reported by the peer. When multipath is enabled, this will be the
     /// last report across all paths.
     pub(crate) observed_external_addr: watch::Sender<Option<SocketAddr>>,
     pub(crate) nat_traversal_updates: tokio::sync::broadcast::Sender<n0_nat_traversal::Event>,
     on_closed: Vec<oneshot::Sender<Closed>>,
+}
+
+#[derive(Debug)]
+struct BufferedTransmit {
+    transmit: proto::Transmit,
+    contents: Vec<u8>,
+    network_path: FourTuple,
+    /// Whether this transmit caused a destination-specific proto scheduling block.
+    path_blocked: bool,
 }
 
 impl State {
@@ -1513,7 +1526,7 @@ impl State {
             sender,
             runtime,
             send_buffer: Vec::new(),
-            buffered_transmit: None,
+            buffered_transmits: VecDeque::new(),
             path_events: tokio::sync::broadcast::channel(32).0,
             observed_external_addr: watch::Sender::new(None),
             nat_traversal_updates: tokio::sync::broadcast::channel(32).0,
@@ -1532,37 +1545,81 @@ impl State {
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
 
-        loop {
-            // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
-                Some(t) => t,
-                None => {
-                    self.send_buffer.clear();
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
-                        Some(t) => {
-                            transmits += match t.segment_size {
-                                None => 1,
-                                Some(s) => t.size.div_ceil(s), // round up
-                            };
-                            t
-                        }
-                        None => break,
+        // Retry each retained transmit once before asking proto for fresh work. A sender may
+        // report WouldBlock as Ready, so limiting this pass to the initial length avoids a spin.
+        let buffered_count = self.buffered_transmits.len();
+        for _ in 0..buffered_count {
+            let mut buffered = self.buffered_transmits.pop_front().unwrap();
+            match self
+                .sender
+                .as_mut()
+                .poll_send(&udp_transmit(&buffered.transmit, &buffered.contents), cx)
+            {
+                Poll::Pending => {
+                    self.buffered_transmits.push_front(buffered);
+                    return Ok(false);
+                }
+                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if !buffered.path_blocked {
+                        self.inner
+                            .set_path_transport_blocked(now, buffered.network_path, true);
+                        buffered.path_blocked = true;
+                    }
+                    self.buffered_transmits.push_back(buffered);
+                }
+                Poll::Ready(Err(err)) => return Err(err),
+                Poll::Ready(Ok(())) => {
+                    if buffered.path_blocked {
+                        self.inner
+                            .set_path_transport_blocked(now, buffered.network_path, false);
                     }
                 }
-            };
+            }
+        }
 
+        loop {
+            self.send_buffer.clear();
+            let Some(t) = self
+                .inner
+                .poll_transmit(now, max_datagrams, &mut self.send_buffer)
+            else {
+                break;
+            };
+            transmits += match t.segment_size {
+                None => 1,
+                Some(s) => t.size.div_ceil(s), // round up
+            };
             let len = t.size;
+            let network_path = FourTuple::new(t.destination, t.src_ip);
             match self
                 .sender
                 .as_mut()
                 .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
             {
                 Poll::Pending => {
-                    self.buffered_transmit = Some(t);
+                    self.buffered_transmits.push_back(BufferedTransmit {
+                        transmit: t,
+                        contents: self.send_buffer[..len].to_vec(),
+                        network_path,
+                        path_blocked: false,
+                    });
                     return Ok(false);
+                }
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.inner
+                        .set_path_transport_blocked(now, network_path, true);
+                    debug_assert!(
+                        self.buffered_transmits
+                            .iter()
+                            .all(|buffered| buffered.network_path != network_path),
+                        "proto scheduled more than one transmit for a transport-blocked path"
+                    );
+                    self.buffered_transmits.push_back(BufferedTransmit {
+                        transmit: t,
+                        contents: self.send_buffer[..len].to_vec(),
+                        network_path,
+                        path_blocked: true,
+                    });
                 }
                 Poll::Ready(Err(e)) => return Err(e),
                 Poll::Ready(Ok(())) => {}

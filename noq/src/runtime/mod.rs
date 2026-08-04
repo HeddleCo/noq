@@ -94,6 +94,12 @@ pub trait UdpSender: Send + Sync + Debug + 'static {
     ///
     /// A single [`UdpSender`] will be reused, even if `poll_send` returns `Poll::Ready` once,
     /// unlike [`Future::poll`], so calling it again after readiness should not panic.
+    ///
+    /// Implementations which multiplex independently writable transports may return an error of
+    /// kind [`io::ErrorKind::WouldBlock`] after registering `cx`'s waker for the transport
+    /// serving `transmit.destination`: the caller retains this transmit, continues sending to
+    /// other destinations, and retries when that waker fires. `Poll::Pending` keeps its
+    /// sender-wide meaning and all other errors remain fatal.
     fn poll_send(
         self: Pin<&mut Self>,
         transmit: &Transmit<'_>,
