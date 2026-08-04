@@ -8,6 +8,7 @@ use testresult::TestResult;
 use tokio_stream::StreamExt;
 
 use std::{
+    collections::{HashMap, HashSet},
     convert::TryInto,
     future::Future,
     io,
@@ -15,13 +16,13 @@ use std::{
     pin::{Pin, pin},
     str,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime};
+use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime, UdpSender};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -328,6 +329,37 @@ impl EndpointFactory {
             Some(server_config),
             UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
             runtime,
+        )
+        .unwrap();
+        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        client_config.transport_config(transport_config);
+        endpoint.set_default_client_config(client_config);
+
+        endpoint
+    }
+
+    fn endpoint_with_abstract_socket(
+        &self,
+        name: impl Into<String>,
+        transport_config: TransportConfig,
+        socket: Box<dyn AsyncUdpSocket>,
+    ) -> Endpoint {
+        let span = info_span!("dummy");
+        span.record("otel.name", name.into());
+        let _guard = span.entered();
+        let key = PrivateKeyDer::Pkcs8(self.cert.signing_key.serialize_der().into());
+        let transport_config = Arc::new(transport_config);
+        let mut server_config =
+            crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap();
+        server_config.transport_config(transport_config.clone());
+
+        let mut roots = RootCertStore::empty();
+        roots.add(self.cert.cert.der().clone()).unwrap();
+        let endpoint = Endpoint::new_with_abstract_socket(
+            self.endpoint_config.clone(),
+            Some(server_config),
+            socket,
+            Arc::new(TokioRuntime),
         )
         .unwrap();
         let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
@@ -1764,6 +1796,206 @@ async fn regression_incoming_accept_after_endpoint_close_panic() -> TestResult {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     runtime.assert_tasks_ok().await;
+    Ok(())
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum RecordedSendOutcome {
+    Blocked,
+    Sent,
+}
+
+#[derive(Debug, Clone)]
+struct RecordedSend {
+    destination: SocketAddr,
+    contents: Vec<u8>,
+    outcome: RecordedSendOutcome,
+}
+
+#[derive(Debug, Default)]
+struct BlockingSenderState {
+    blocked: HashSet<SocketAddr>,
+    wakers: HashMap<SocketAddr, Waker>,
+    attempts: Vec<RecordedSend>,
+    polls: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BlockingSenderControl(Arc<Mutex<BlockingSenderState>>);
+
+impl BlockingSenderControl {
+    fn block(&self, destination: SocketAddr) {
+        self.0.lock().unwrap().blocked.insert(destination);
+    }
+
+    fn unblock(&self, destination: SocketAddr) {
+        let waker = {
+            let mut state = self.0.lock().unwrap();
+            state.blocked.remove(&destination);
+            state.wakers.remove(&destination)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn attempts(&self) -> Vec<RecordedSend> {
+        self.0.lock().unwrap().attempts.clone()
+    }
+
+    fn polls(&self) -> usize {
+        self.0.lock().unwrap().polls
+    }
+}
+
+#[derive(Debug)]
+struct BlockingSocket {
+    inner: Box<dyn AsyncUdpSocket>,
+    control: BlockingSenderControl,
+}
+
+impl BlockingSocket {
+    fn new(inner: Box<dyn AsyncUdpSocket>, control: BlockingSenderControl) -> Self {
+        Self { inner, control }
+    }
+}
+
+#[derive(Debug)]
+struct BlockingSender {
+    inner: Pin<Box<dyn UdpSender>>,
+    control: BlockingSenderControl,
+}
+
+impl UdpSender for BlockingSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &udp::Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        {
+            let mut state = self.control.0.lock().unwrap();
+            state.polls += 1;
+            if state.blocked.contains(&transmit.destination) {
+                state
+                    .wakers
+                    .insert(transmit.destination, cx.waker().clone());
+                state.attempts.push(RecordedSend {
+                    destination: transmit.destination,
+                    contents: transmit.contents.to_vec(),
+                    outcome: RecordedSendOutcome::Blocked,
+                });
+                return Poll::Ready(Err(io::ErrorKind::WouldBlock.into()));
+            }
+        }
+
+        let result = self.inner.as_mut().poll_send(transmit, cx);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.control.0.lock().unwrap().attempts.push(RecordedSend {
+                destination: transmit.destination,
+                contents: transmit.contents.to_vec(),
+                outcome: RecordedSendOutcome::Sent,
+            });
+        }
+        result
+    }
+
+    fn max_transmit_segments(&self) -> std::num::NonZeroUsize {
+        self.inner.max_transmit_segments()
+    }
+}
+
+impl AsyncUdpSocket for BlockingSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(BlockingSender {
+            inner: self.inner.create_sender(),
+            control: self.control.clone(),
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_receive_segments(&self) -> std::num::NonZeroUsize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+#[tokio::test]
+async fn blocked_transport_parks_and_retries() -> TestResult {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let mut transport = TransportConfig::default();
+    transport.initial_rtt(Duration::from_millis(10));
+    let server = factory.endpoint_with_config("server", transport.clone());
+    let server_addr = server.local_addr()?;
+
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    socket.set_nonblocking(true)?;
+    let inner = crate::runtime::Runtime::wrap_udp_socket(&TokioRuntime, socket)?;
+    let control = BlockingSenderControl::default();
+    control.block(server_addr);
+    let client = factory.endpoint_with_abstract_socket(
+        "client",
+        transport,
+        Box::new(BlockingSocket::new(inner, control.clone())),
+    );
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut stream = conn.accept_uni().await.unwrap();
+        stream.read_to_end(usize::MAX).await.unwrap()
+    });
+    let client_task = tokio::spawn(async move {
+        let conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(b"backpressure completed").await.unwrap();
+        stream.finish().unwrap();
+        stream.stopped().await.unwrap();
+    });
+
+    // Wait well beyond the configured initial PTO. The retained packet must not arm loss
+    // recovery while it is still local.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let blocked = control.attempts();
+    assert_eq!(blocked.len(), 1, "blocked path must retain one transmit");
+    assert_eq!(blocked[0].outcome, RecordedSendOutcome::Blocked);
+    let polls = control.polls();
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert_eq!(control.polls(), polls, "blocked driver must remain parked");
+
+    let retained = blocked[0].contents.clone();
+    control.unblock(server_addr);
+    client_task.await?;
+    assert_eq!(server_task.await?, b"backpressure completed");
+
+    let attempts = control.attempts();
+    let retried = attempts
+        .iter()
+        .find(|attempt| {
+            attempt.destination == server_addr && attempt.outcome == RecordedSendOutcome::Sent
+        })
+        .expect("retained transmit was not retried");
+    assert_eq!(retried.contents, retained, "retry must be byte-identical");
+
     Ok(())
 }
 

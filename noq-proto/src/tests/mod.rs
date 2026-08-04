@@ -2079,6 +2079,65 @@ fn finish_stream_flow_control_reordered() {
     let _ = chunks.finalize();
 }
 
+fn poll_client_transmit(pair: &mut ConnPair) -> (Transmit, Bytes) {
+    let mut buffer = Vec::new();
+    let transmit = pair
+        .poll_transmit(Client, std::num::NonZeroUsize::MIN, &mut buffer)
+        .expect("client should have a transmit ready");
+    assert_eq!(transmit.size, buffer.len());
+    (transmit, Bytes::from(buffer))
+}
+
+fn drive_server_until_client_packet(pair: &mut ConnPair) {
+    while pair.client.inbound.is_empty() {
+        pair.time = pair
+            .server
+            .next_wakeup()
+            .expect("server should receive a packet or wake to send its ACK");
+        pair.drive_server();
+    }
+}
+
+#[test]
+fn transport_unblock_wire_min_rtt() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .with_latency(Duration::from_millis(40))
+        .disable_mtud_discovery()
+        .connect();
+    let network_path = pair.network_path(Client, PathId::ZERO)?;
+    let established_min_rtt = pair.conn(Client).min_rtt(PathId::ZERO).unwrap();
+
+    // Put one ping on the wire, then build a second transmit which remains held locally.
+    pair.ping_path(Client, PathId::ZERO)?;
+    let wire = poll_client_transmit(&mut pair);
+    pair.client.outbound.push_back(wire);
+    pair.drive_client();
+
+    pair.ping_path(Client, PathId::ZERO)?;
+    let held = poll_client_transmit(&mut pair);
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .set_path_transport_blocked(now, network_path, true);
+
+    // Produce the wire packet's ACK, but unblock immediately before the client processes it.
+    drive_server_until_client_packet(&mut pair);
+    pair.time = pair.client.inbound.next_recv_time().unwrap();
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .set_path_transport_blocked(now, network_path, false);
+    pair.client.outbound.push_back(held);
+    pair.drive_client();
+
+    let min_rtt = pair.conn(Client).min_rtt(PathId::ZERO).unwrap();
+    assert!(
+        min_rtt >= established_min_rtt / 2,
+        "wire ACK produced an implausibly small RTT sample: {min_rtt:?} (was {established_min_rtt:?})"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn handshake_1rtt_handling() {
     let _guard = subscribe();

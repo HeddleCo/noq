@@ -1289,6 +1289,80 @@ fn path_scheduling_path_status() -> TestResult {
 }
 
 #[test]
+fn transport_blocked_ready_path_flows() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+
+    let path_0 = pair.network_path(Client, PathId::ZERO)?;
+    let mut client_addr_1 = pair.routes.as_basic().client_addr;
+    let mut server_addr_1 = pair.routes.as_basic().server_addr;
+    client_addr_1.set_port(client_addr_1.port() + 1);
+    server_addr_1.set_port(server_addr_1.port() + 1);
+    pair.routes = ManyToManyRouting::simple_symmetric(
+        [pair.routes.as_basic().client_addr, client_addr_1],
+        [pair.routes.as_basic().server_addr, server_addr_1],
+    )
+    .into();
+    let path_1_network = FourTuple::new(server_addr_1, Some(client_addr_1.ip()));
+    let path_1 = pair.open_path(Client, path_1_network, PathStatus::Available)?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    let path_0_before = pair
+        .path_stats(Client, PathId::ZERO)
+        .unwrap()
+        .udp_tx
+        .datagrams;
+    let path_1_before = pair.path_stats(Client, path_1).unwrap().udp_tx.datagrams;
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .set_path_transport_blocked(now, path_0, true);
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .write(b"ready backup path")
+        .unwrap();
+    pair.send_stream(Client, stream).finish().unwrap();
+    pair.drive();
+
+    let path_0_after = pair
+        .path_stats(Client, PathId::ZERO)
+        .unwrap()
+        .udp_tx
+        .datagrams;
+    let path_1_after = pair.path_stats(Client, path_1).unwrap().udp_tx.datagrams;
+    assert_eq!(path_0_after, path_0_before);
+    assert!(path_1_after > path_1_before);
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(false)?;
+    assert_matches!(
+        chunks.next(usize::MAX),
+        Ok(Some(chunk)) if chunk.bytes.as_ref() == b"ready backup path"
+    );
+    let _ = chunks.finalize();
+
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .set_path_transport_blocked(now, path_0, false);
+    pair.ping_path(Client, PathId::ZERO)?;
+    pair.drive();
+    assert!(
+        pair.path_stats(Client, PathId::ZERO)
+            .unwrap()
+            .udp_tx
+            .datagrams
+            > path_0_after
+    );
+
+    Ok(())
+}
+
+#[test]
 fn server_abandon_last_verified_path() -> TestResult {
     // The client abandons the last verified path the server has. The server is expected to
     // send PATH_ABANDON on the abandoned path itself in this case.
