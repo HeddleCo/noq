@@ -45,7 +45,17 @@ mod tracking {
             // We don't bother dispatching through Runtime::now because they're pure performance
             // diagnostics.
             let now = Instant::now();
-            let guard = self.inner.lock().unwrap();
+            // Poison-tolerant: never panic on a poisoned lock. A previous panic while the
+            // connection state was held (e.g. a `bytes` invariant violation on a mid-flight
+            // teardown) would otherwise poison this mutex, and every subsequent `.lock()` —
+            // including those reached from `Drop` impls during unwinding — would panic. A
+            // panic in a `Drop` during unwind aborts the whole process. Recovering the guard
+            // via `into_inner()` converts that fatal, process-wide abort into a recoverable
+            // per-connection failure. See weft#2077.
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             let lock_time = Instant::now();
             let elapsed = lock_time.duration_since(now);
@@ -135,7 +145,17 @@ mod non_tracking {
         /// The purpose will be recorded in the list of last lock owners
         pub(crate) fn lock(&self, _purpose: &'static str) -> MutexGuard<'_, T> {
             MutexGuard {
-                guard: self.inner.lock().unwrap(),
+                // Poison-tolerant: never panic on a poisoned lock. A previous panic while the
+                // connection state was held (e.g. a `bytes` invariant violation on a mid-flight
+                // teardown) would otherwise poison this mutex, and every subsequent `.lock()` —
+                // including those reached from `Drop` impls during unwinding — would panic. A
+                // panic in a `Drop` during unwind aborts the whole process. Recovering the guard
+                // via `into_inner()` converts that fatal, process-wide abort into a recoverable
+                // per-connection failure. See weft#2077.
+                guard: self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
             }
         }
     }
@@ -161,3 +181,78 @@ mod non_tracking {
 
 #[cfg(not(feature = "lock_tracking"))]
 pub(crate) use non_tracking::{Mutex, MutexGuard};
+
+#[cfg(test)]
+mod poison_tests {
+    use super::Mutex;
+    use std::sync::Arc;
+
+    /// Regression test for weft#2077: acquiring a poisoned lock must not panic.
+    ///
+    /// Before the fix, `lock()` did `.unwrap()` on the result, so a lock that had
+    /// been poisoned by a panic (while the connection state was held) would panic
+    /// on every subsequent acquisition. Because such acquisitions happen inside
+    /// `Drop` impls during unwinding, that second panic aborted the whole process.
+    #[test]
+    fn lock_is_poison_tolerant() {
+        let mutex = Arc::new(Mutex::new(0u32));
+
+        // Poison the inner std mutex by panicking while the guard is held.
+        let poisoner = {
+            let mutex = mutex.clone();
+            std::thread::spawn(move || {
+                let mut guard = mutex.lock("poison");
+                *guard = 41;
+                panic!("intentional panic to poison the mutex");
+            })
+        };
+        assert!(poisoner.join().is_err(), "poisoner thread should panic");
+
+        // Acquiring the lock again must NOT panic despite the poison, and must
+        // recover the guarded value.
+        let mut guard = mutex.lock("recover");
+        assert_eq!(*guard, 41, "poisoned data should be recovered, not lost");
+        *guard += 1;
+        assert_eq!(*guard, 42);
+    }
+
+    /// Regression test for the actual abort vector of weft#2077.
+    ///
+    /// A poisoned lock is acquired from a `Drop` impl that runs *during unwinding*
+    /// of another panic. Before the fix the `.unwrap()` panicked there, and a panic
+    /// while already unwinding is a non-unwinding double panic that calls
+    /// `abort()`, killing the whole process (and this test binary). After the fix
+    /// the lock is recovered without panicking and unwinding completes normally.
+    #[test]
+    fn poisoned_lock_in_drop_during_unwind_does_not_abort() {
+        struct LocksOnDrop(Arc<Mutex<u32>>);
+        impl Drop for LocksOnDrop {
+            fn drop(&mut self) {
+                // Runs while the panic below is unwinding the stack.
+                let _guard = self.0.lock("drop-during-unwind");
+            }
+        }
+
+        let mutex = Arc::new(Mutex::new(0u32));
+
+        // Poison the mutex.
+        let poisoner = {
+            let mutex = mutex.clone();
+            std::thread::spawn(move || {
+                let _guard = mutex.lock("poison");
+                panic!("intentional panic to poison the mutex");
+            })
+        };
+        assert!(poisoner.join().is_err());
+
+        // Panic with a `LocksOnDrop` on the stack so its `Drop` acquires the
+        // poisoned lock during unwinding. `catch_unwind` keeps the test alive if
+        // (and only if) that `Drop` did not itself panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _drops_and_locks = LocksOnDrop(mutex.clone());
+            panic!("trigger unwind with a poisoned-lock Drop on the stack");
+        }));
+        assert!(result.is_err(), "the induced panic should have been caught");
+        // Reaching here means the Drop did not double-panic/abort.
+    }
+}
