@@ -195,7 +195,11 @@ fn log_sendmsg_error(
     transmit: &Transmit<'_>,
 ) {
     let now = Instant::now();
-    let last_send_error = &mut *last_send_error.lock().expect("poisend lock");
+    // Poison-tolerant: this is only a rate-limit timestamp for error logging, and a poisoned
+    // lock (from a panic elsewhere) must never escalate a send error into a second panic.
+    let last_send_error = &mut *last_send_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if now.saturating_duration_since(*last_send_error) > IO_ERROR_LOG_INTERVAL {
         *last_send_error = now;
         log::debug!(
