@@ -1917,3 +1917,110 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
         TokioRuntime.now()
     }
 }
+
+/// Stress test for the connection-drop / stream-cleanup path under concurrency.
+///
+/// Regression test for the process-abort described in weft#2077: a `bytes`
+/// invariant violation panics while a connection mutex is held, poisoning it;
+/// a subsequent `.lock().unwrap()` reached from a `Drop` impl then panics again
+/// during unwinding, turning a recoverable per-connection error into a whole-
+/// process `abort()`.
+///
+/// The test hammers many concurrent connect / write / abrupt-drop cycles so
+/// that connections and streams are torn down mid-flight. Before the fix this
+/// aborts the test process; after the fix it completes cleanly.
+#[test]
+fn concurrent_connection_drop_stress() {
+    let _guard = subscribe();
+    let runtime = rt_threaded();
+    let factory = EndpointFactory::new();
+    let endpoint = {
+        let _guard = runtime.enter();
+        factory.endpoint("stress")
+    };
+
+    runtime.block_on(async move {
+        // Server: accept connections, accept uni streams, read a little, then drop
+        // everything abruptly (no finish / no stop) to force resets during teardown.
+        let server = endpoint.clone();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Some(incoming) = server.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else {
+                        return;
+                    };
+                    loop {
+                        match conn.accept_uni().await {
+                            Ok(mut recv) => {
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    // Read a bit then drop mid-stream.
+                                    for _ in 0..2 {
+                                        if recv.read(&mut buf).await.unwrap_or(None).is_none() {
+                                            break;
+                                        }
+                                    }
+                                    // drop `recv` mid-flight -> STOP
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                        // Periodically abandon the whole connection mid-flight.
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+                        if COUNTER.fetch_add(1, Ordering::Relaxed).is_multiple_of(4) {
+                            break; // drop conn
+                        }
+                    }
+                    // drop conn abruptly
+                });
+            }
+        });
+
+        let addr = endpoint.local_addr().unwrap();
+
+        // Many rounds of concurrent connect + write + abrupt-drop.
+        const ROUNDS: usize = 40;
+        const CONNS_PER_ROUND: usize = 40;
+        let payload = Bytes::from(vec![0xabu8; 64 * 1024]);
+
+        for _round in 0..ROUNDS {
+            let mut handles = Vec::with_capacity(CONNS_PER_ROUND);
+            for _ in 0..CONNS_PER_ROUND {
+                let endpoint = endpoint.clone();
+                let payload = payload.clone();
+                handles.push(tokio::spawn(async move {
+                    let Ok(connecting) = endpoint.connect(addr, "localhost") else {
+                        return;
+                    };
+                    let Ok(conn) = connecting.await else {
+                        return;
+                    };
+                    // Open several uni streams, write, and drop mid-flight without
+                    // finishing or awaiting stopped() -> reset with unacked data.
+                    let mut streams = Vec::new();
+                    for _ in 0..8 {
+                        match conn.open_uni().await {
+                            Ok(mut send) => {
+                                let _ = send.write_chunk(payload.clone()).await;
+                                streams.push(send);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // Drop the streams and connection abruptly and immediately.
+                    drop(streams);
+                    drop(conn);
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        }
+
+        server_task.abort();
+    });
+}
