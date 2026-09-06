@@ -6148,10 +6148,26 @@ impl Connection {
         }
 
         // ACK_FREQUENCY
+        //
+        // weft#2077 (Bug B): every other variable-length frame below gates its
+        // write on `frame_space_remaining()`; this block used to write
+        // unconditionally. When the packet was nearly full — which multipath
+        // path-validation churn makes common, as many PATH_STATUS / OBSERVED_ADDR
+        // / ADD_ADDRESS / ACK frames compete for the same packet — the
+        // `Limit`-wrapped `TransmitBuf` had fewer bytes free than the frame
+        // needs, and encoding `request_max_ack_delay` (a 4-byte varint) overran
+        // `bytes`' invariant and panicked ("advance out of bounds: the len is 0
+        // but advancing by 4"). Under a held connection lock that poisoned the
+        // noq mutex and aborted the process. Gate on the frame's size bound and,
+        // only when there is room, clear the pending flag and write — otherwise
+        // the frame stays pending and rides the next packet, exactly like the
+        // sibling frames.
         if !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
-            && mem::replace(&mut space.pending.ack_frequency, false)
+            && space.pending.ack_frequency
+            && builder.frame_space_remaining() >= frame::AckFrequency::SIZE_BOUND
         {
+            space.pending.ack_frequency = false;
             let sequence_number = self.ack_frequency.next_sequence_number();
 
             // Safe to unwrap because this is always provided when ACK frequency is enabled

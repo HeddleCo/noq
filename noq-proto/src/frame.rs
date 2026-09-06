@@ -2082,6 +2082,13 @@ pub(crate) struct AckFrequency {
 }
 
 impl AckFrequency {
+    /// Largest number of bytes an `ACK_FREQUENCY` frame can occupy on the wire.
+    ///
+    /// The frame type varint plus its four `VarInt` fields, each of which is at
+    /// most 8 bytes. Used to gate the write in `Connection::populate_packet` so
+    /// the frame is only emitted when the packet has room for it — see weft#2077.
+    pub(crate) const SIZE_BOUND: usize = FrameType::AckFrequency.size() + 8 + 8 + 8 + 8;
+
     const fn get_type(&self) -> FrameType {
         FrameType::AckFrequency
     }
@@ -2521,6 +2528,60 @@ mod test {
     use super::*;
     use crate::coding::Encodable;
     use assert_matches::assert_matches;
+
+    /// weft#2077 (Bug B): `ACK_FREQUENCY` must not be written into a packet that
+    /// cannot hold it. `Connection::populate_packet` now gates the write on
+    /// `AckFrequency::SIZE_BOUND`; this proves that bound is a true upper bound on
+    /// the encoded size (so the gate is sound) and reproduces the exact `bytes`
+    /// overrun the gate prevents — writing the frame into a buffer with too little
+    /// room panics ("advance out of bounds"), while a `SIZE_BOUND`-sized buffer
+    /// always succeeds. Pre-fix this frame had no `SIZE_BOUND` and the write was
+    /// unconditional, so the crash fired under a full packet.
+    #[test]
+    fn ack_frequency_respects_size_bound() {
+        use bytes::BufMut;
+
+        // Worst case: every field is a maximal (8-byte) varint.
+        let frame = AckFrequency {
+            sequence: VarInt::MAX,
+            ack_eliciting_threshold: VarInt::MAX,
+            request_max_ack_delay: VarInt::MAX,
+            reordering_threshold: VarInt::MAX,
+        };
+
+        let mut encoded = Vec::new();
+        frame.encode(&mut encoded);
+        assert!(
+            encoded.len() <= AckFrequency::SIZE_BOUND,
+            "encoded ACK_FREQUENCY is {} bytes but SIZE_BOUND is {}",
+            encoded.len(),
+            AckFrequency::SIZE_BOUND,
+        );
+
+        // Too little room: encoding overruns `bytes`' invariant and panics — the
+        // weft#2077 crash. The gate in `populate_packet` is what keeps us out of
+        // this branch in production.
+        let overrun = std::panic::catch_unwind(|| {
+            let mut scratch = [0u8; AckFrequency::SIZE_BOUND];
+            let mut limited = (&mut scratch[..]).limit(encoded.len() - 1);
+            frame.encode(&mut limited);
+        });
+        assert!(
+            overrun.is_err(),
+            "writing ACK_FREQUENCY into an undersized buffer must overrun"
+        );
+
+        // Enough room (the bound the gate enforces): never overruns.
+        let ok = std::panic::catch_unwind(|| {
+            let mut scratch = [0u8; AckFrequency::SIZE_BOUND];
+            let mut limited = (&mut scratch[..]).limit(AckFrequency::SIZE_BOUND);
+            frame.encode(&mut limited);
+        });
+        assert!(
+            ok.is_ok(),
+            "SIZE_BOUND bytes of room must always fit an ACK_FREQUENCY frame"
+        );
+    }
 
     #[test]
     fn frame_type() {
