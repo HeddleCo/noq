@@ -3413,6 +3413,32 @@ fn setup_ack_frequency_test(max_ack_delay: Duration) -> (Pair, ConnectionHandle,
     (pair, client_ch, server_ch)
 }
 
+/// weft#2077: `populate_packet` must not encode `ACK_FREQUENCY` unless
+/// `frame_space_remaining() >= AckFrequency::SIZE_BOUND`.
+///
+/// `room = SIZE_BOUND - 1` is still large enough for a normal (non-worst-case) frame.
+/// With the gate the write is skipped and the frame stays pending. Removing the
+/// `SIZE_BOUND` conjunct writes the frame into that buffer and this test fails.
+#[test]
+fn ack_frequency_write_is_gated_on_size_bound() {
+    let _guard = subscribe();
+    let (mut pair, client_ch, _server_ch) = setup_ack_frequency_test(Duration::from_millis(30));
+    let conn = pair.client_conn_mut(client_ch);
+
+    let too_small = frame::AckFrequency::SIZE_BOUND - 1;
+    assert!(
+        !conn.probe_ack_frequency_write(too_small),
+        "ACK_FREQUENCY must stay pending when only {too_small} bytes remain \
+         (SIZE_BOUND is {}); an ungated write encodes into this buffer",
+        frame::AckFrequency::SIZE_BOUND,
+    );
+
+    assert!(
+        conn.probe_ack_frequency_write(frame::AckFrequency::SIZE_BOUND),
+        "ACK_FREQUENCY must be written once SIZE_BOUND bytes of frame space are free"
+    );
+}
+
 /// Verify that max ACK delay is counted from the first ACK-eliciting packet
 #[test]
 fn ack_frequency_ack_delayed_from_first_of_flight() {

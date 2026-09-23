@@ -6070,6 +6070,72 @@ impl Connection {
         }
     }
 
+    /// Drive [`Self::populate_packet`] with `room` bytes of frame space and a pending
+    /// `ACK_FREQUENCY`, and report whether the frame was written.
+    ///
+    /// Other pending frames are cleared first so the only write under test is the
+    /// `ACK_FREQUENCY` block. Returns `true` when that block encoded the frame.
+    #[cfg(test)]
+    pub(crate) fn probe_ack_frequency_write(&mut self, room: usize) -> bool {
+        let space_id = SpaceId::Data;
+        let path_id = PathId::ZERO;
+        {
+            let space = &mut self.spaces[space_id];
+            space.pending = Retransmits {
+                ack_frequency: true,
+                ..Retransmits::default()
+            };
+            for pns in space.number_spaces.values_mut() {
+                pns.pending_ping = false;
+                pns.pending_immediate_ack = false;
+                pns.pending_path_responses = Default::default();
+                pns.pending_acks.suppress_for_test();
+            }
+        }
+        {
+            let path = &mut self.paths.get_mut(&path_id).expect("known path").data;
+            path.pending_challenge = false;
+            path.pending.observed_address = false;
+        }
+
+        let before = self
+            .path_stats
+            .get(path_id)
+            .map(|stats| stats.frame_tx.ack_frequency)
+            .unwrap_or(0);
+
+        let mut raw = Vec::new();
+        let mut tbuf = TransmitBuf::new(&mut raw, NonZeroUsize::MIN, room);
+        tbuf.start_new_datagram_with_size(room);
+        let mut builder = PacketBuilder::simple_data_buf(&mut tbuf);
+        assert_eq!(
+            builder.frame_space_remaining(),
+            room,
+            "test buffer must expose exactly {room} bytes of frame space"
+        );
+
+        let scheduling = PathSchedulingInfo {
+            is_abandoned: false,
+            may_send_data: true,
+            may_send_close: false,
+            may_self_abandon: false,
+        };
+        self.populate_packet(Instant::now(), space_id, path_id, &scheduling, &mut builder);
+
+        let after = self
+            .path_stats
+            .get(path_id)
+            .map(|stats| stats.frame_tx.ack_frequency)
+            .unwrap_or(0);
+        let wrote = after > before;
+        let still_pending = self.spaces[space_id].pending.ack_frequency;
+        assert_eq!(
+            wrote, !still_pending,
+            "ACK_FREQUENCY pending flag must clear if and only if the frame was written"
+        );
+        wrote
+    }
+
     /// Populates a packet with frames
     ///
     /// This tries to fit as many frames as possible into the packet.

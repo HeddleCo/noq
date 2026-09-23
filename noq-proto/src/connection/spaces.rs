@@ -1168,6 +1168,14 @@ impl PendingAcks {
         self.immediate_ack_required && !self.ranges.is_empty()
     }
 
+    /// Drop any queued ACK so a unit test can drive `populate_packet` without an ACK frame
+    /// consuming the packet first.
+    #[cfg(test)]
+    pub(super) fn suppress_for_test(&mut self) {
+        self.immediate_ack_required = false;
+        self.ranges = ArrayRangeSet::default();
+    }
+
     /// Returns the delay since the packet with the largest packet number was received
     pub(super) fn ack_delay(&self, now: Instant) -> Duration {
         self.largest_packet
