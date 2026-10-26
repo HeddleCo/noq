@@ -115,56 +115,67 @@ impl Assembler {
         self.data.insert(idx, chunk);
     }
 
-    /// Copy fragmented chunk data to new chunks backed by a single buffer
+    /// Coalesce every run of contiguous chunks into one buffer, and copy lone fragmented
+    /// chunks into buffers of their own size.
     ///
-    /// This makes sure we're not unnecessarily holding on to many larger allocations.
-    /// We merge contiguous chunks in the process of doing so.
+    /// Afterwards each buffered chunk is separated from the next by a real gap, so
+    /// `data.len()` counts gaps rather than frames: a reader that falls behind on in-order
+    /// full-size frames leaves one chunk here, not one per frame. Lone well-utilized
+    /// chunks are kept as they are, without a copy.
     fn defragment(&mut self) {
         let mut buffers = mem::take(&mut self.data);
         self.buffered = 0;
-        let mut fragmented_buffered = 0;
         let mut offset = self.bytes_read;
         for chunk in &mut buffers {
             chunk.try_mark_defragment(offset);
             let size = chunk.bytes.len();
             offset = chunk.offset + size as u64;
             self.buffered += size;
-            if !chunk.defragmented {
-                fragmented_buffered += size;
-            }
         }
         self.allocated = self.buffered;
-        self.data.reserve(buffers.len());
-        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
-        let mut offset = self.bytes_read;
+
+        // A run of one chunk is held uncopied in `single`; a second contiguous chunk
+        // moves the run into `run`, which owns the coalesced bytes.
+        let mut single: Option<Buffer> = None;
+        let mut run: Option<(u64, BytesMut)> = None;
         for chunk in buffers {
-            if chunk.defragmented {
-                // bytes might be empty after try_mark_defragment
-                if chunk.bytes.is_empty() {
-                    continue;
-                }
-                // The accumulated chunk starts before this one, so it goes first
-                if !buffer.is_empty() {
-                    self.data
-                        .push_back(Buffer::new_defragmented(offset, buffer.split().freeze()));
-                }
-                offset = chunk.offset + chunk.bytes.len() as u64;
-                self.data.push_back(chunk);
+            // bytes might be empty after try_mark_defragment
+            if chunk.bytes.is_empty() {
                 continue;
             }
-            // Overlap is resolved by try_mark_defragment
-            if chunk.offset != offset + (buffer.len() as u64) {
-                if !buffer.is_empty() {
-                    self.data
-                        .push_back(Buffer::new_defragmented(offset, buffer.split().freeze()));
+            if let Some((start, bytes)) = &mut run {
+                if chunk.offset == *start + bytes.len() as u64 {
+                    bytes.extend_from_slice(&chunk.bytes);
+                    continue;
                 }
-                offset = chunk.offset;
+            } else if let Some(first) = single.take_if(|first| first.end() == chunk.offset) {
+                let start = first.offset;
+                let mut bytes = first.into_owned(chunk.bytes.len());
+                bytes.extend_from_slice(&chunk.bytes);
+                run = Some((start, bytes));
+                continue;
             }
-            buffer.extend_from_slice(&chunk.bytes);
+            self.flush_run(single.take(), run.take());
+            single = Some(chunk);
         }
-        if !buffer.is_empty() {
+        self.flush_run(single, run);
+    }
+
+    /// Push the run `defragment` was accumulating, if any.
+    fn flush_run(&mut self, single: Option<Buffer>, run: Option<(u64, BytesMut)>) {
+        if let Some((start, bytes)) = run {
             self.data
-                .push_back(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                .push_back(Buffer::new_defragmented(start, bytes.freeze()));
+        } else if let Some(chunk) = single {
+            if chunk.defragmented {
+                self.data.push_back(chunk);
+            } else {
+                // Release the over-allocated backing buffer
+                self.data.push_back(Buffer::new_defragmented(
+                    chunk.offset,
+                    Bytes::copy_from_slice(&chunk.bytes),
+                ));
+            }
         }
     }
 
@@ -304,6 +315,33 @@ impl Buffer {
             allocation_size,
             defragmented: true,
         }
+    }
+
+    /// Offset just past this buffer's data.
+    fn end(&self) -> u64 {
+        self.offset + self.bytes.len() as u64
+    }
+
+    /// This buffer's bytes in a `BytesMut` with room for `additional` more.
+    ///
+    /// Reuses the allocation when this is a well-utilized buffer nothing else references,
+    /// such as an earlier run, so a run that keeps growing is not copied again on every
+    /// compaction. Otherwise copies.
+    fn into_owned(self, additional: usize) -> BytesMut {
+        let bytes = if self.defragmented {
+            match self.bytes.try_into_mut() {
+                Ok(mut bytes) => {
+                    bytes.reserve(additional);
+                    return bytes;
+                }
+                Err(bytes) => bytes,
+            }
+        } else {
+            self.bytes
+        };
+        let mut owned = BytesMut::with_capacity(bytes.len() + additional);
+        owned.extend_from_slice(&bytes);
+        owned
     }
 
     /// Discards data before `offset` and flags `self` as defragmented if it has good utilization
@@ -928,6 +966,95 @@ mod test {
             got.extend_from_slice(&chunk.bytes);
         }
         assert_eq!(&got[..], b"abcdefghij");
+    }
+
+    /// A full-size frame as a packet delivers it: the frame fills almost all of the packet
+    /// payload it is accounted against, so it is well utilized from the start.
+    fn full_frame(x: &mut Assembler, offset: u64) -> Result<(), TooManyChunks> {
+        x.insert(
+            offset,
+            Bytes::from(vec![(offset / FRAME) as u8; FRAME as usize]),
+            1440,
+        )
+    }
+    const FRAME: u64 = 1400;
+
+    #[test]
+    fn unread_in_order_frames_coalesce_past_compaction() {
+        // A reader that stops reading while in-order full-size frames keep arriving has no
+        // gaps at all, so it must never hit the gap bound.
+        let mut x = Assembler::new();
+        let frames = 8 * COMPACT_THRESHOLD as u64;
+        for i in 0..frames {
+            full_frame(&mut x, i * FRAME).expect("in-order data is not a gap");
+            assert!(x.data.len() <= COMPACT_THRESHOLD + 1);
+        }
+        let mut read = 0u64;
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            assert_eq!(chunk.offset, read);
+            for (i, byte) in chunk.bytes.iter().enumerate() {
+                assert_eq!(*byte, ((read + i as u64) / FRAME) as u8);
+            }
+            read += chunk.bytes.len() as u64;
+        }
+        assert_eq!(read, frames * FRAME);
+        assert_eq!(x.buffered, 0);
+    }
+
+    #[test]
+    fn one_hole_behind_unread_frames_is_one_gap() {
+        // Frame 0 is still missing: everything after it is one contiguous run.
+        let mut x = Assembler::new();
+        for i in 1..(4 * COMPACT_THRESHOLD as u64) {
+            full_frame(&mut x, i * FRAME).expect("one hole is one gap");
+        }
+        x.defragment();
+        assert_eq!(x.data.len(), 1);
+        full_frame(&mut x, 0).unwrap();
+        let mut read = 0;
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            read += chunk.bytes.len() as u64;
+        }
+        assert_eq!(read, 4 * COMPACT_THRESHOLD as u64 * FRAME);
+    }
+
+    #[test]
+    fn more_than_max_chunks_real_gaps_still_rejected() {
+        // MAX_CHUNKS + 1 separate runs of full-size frames, each followed by a missing
+        // frame, then contiguous data at the top until the count forces a compaction.
+        let mut x = Assembler::new();
+        let mut offset = FRAME; // frame 0 is missing too
+        let mut result = Ok(());
+        for _ in 0..=MAX_CHUNKS {
+            result = full_frame(&mut x, offset);
+            offset += 2 * FRAME;
+        }
+        assert!(result.is_ok(), "no compaction yet");
+        for _ in 0..(2 * COMPACT_THRESHOLD) {
+            result = full_frame(&mut x, offset);
+            if result.is_err() {
+                break;
+            }
+            offset += FRAME;
+        }
+        assert_matches!(result, Err(TooManyChunks));
+    }
+
+    #[test]
+    fn max_chunks_real_gaps_accepted() {
+        // Exactly MAX_CHUNKS runs (counting the run at the top) survive compaction.
+        let mut x = Assembler::new();
+        let mut offset = FRAME;
+        for _ in 0..(MAX_CHUNKS - 1) {
+            full_frame(&mut x, offset).unwrap();
+            offset += 2 * FRAME;
+        }
+        for _ in 0..(2 * COMPACT_THRESHOLD) {
+            full_frame(&mut x, offset).expect("within the gap bound");
+            offset += FRAME;
+        }
+        x.defragment();
+        assert_eq!(x.data.len(), MAX_CHUNKS);
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {
