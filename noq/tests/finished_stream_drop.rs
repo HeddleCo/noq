@@ -19,7 +19,7 @@ async fn finished_stream_drop_preserves_buffered_data() -> anyhow::Result<()> {
             PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der()).into(),
         )?;
         let server = Endpoint::server(server_config, "127.0.0.1:0".parse()?)?;
-        let mut client = Endpoint::client("127.0.0.1:0".parse()?)?;
+        let client = Endpoint::client("127.0.0.1:0".parse()?)?;
         client.set_default_client_config(ClientConfig::with_root_certificates(Arc::new(roots))?);
         let (client_connection, server_connection) = tokio::try_join!(
             async { anyhow::Ok(client.connect(server.local_addr()?, "localhost")?.await?) },
