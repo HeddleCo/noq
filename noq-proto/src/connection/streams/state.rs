@@ -2179,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_offset_is_per_stream_and_tracks_contiguous_acks() {
+    fn acknowledged_bytes_is_per_stream_and_tracks_out_of_order_acks() {
         let mut state = make(Side::Client);
         state.set_params(&TransportParameters {
             initial_max_data: 1024u32.into(),
@@ -2203,10 +2203,10 @@ mod tests {
                 pending: &mut pending,
                 conn_state: &conn_state,
             };
-            assert_eq!(stream.acknowledged_offset(), Ok(0));
+            assert_eq!(stream.acknowledged_bytes(), Ok(0));
             assert_eq!(stream.write(&[0; 16]), Ok(16));
             stream.finish().unwrap();
-            assert_eq!(stream.acknowledged_offset(), Ok(0), "writes are not ACKs");
+            assert_eq!(stream.acknowledged_bytes(), Ok(0), "writes are not ACKs");
             ids.push(id);
         }
         for (id, offsets) in [(ids[1], 0..8), (ids[0], 8..16)] {
@@ -2223,25 +2223,25 @@ mod tests {
             conn_state: &conn_state,
         };
         assert_eq!(
-            stream.acknowledged_offset(),
-            Ok(0),
-            "sibling ACKs and holes do not advance the offset"
+            stream.acknowledged_bytes(),
+            Ok(8),
+            "only this stream's ACKs advance progress, including out-of-order ACKs"
         );
         stream.state.received_ack_of(frame::StreamMeta {
             id: ids[0],
             offsets: 0..4,
             fin: false,
         });
-        assert_eq!(stream.acknowledged_offset(), Ok(4));
+        assert_eq!(stream.acknowledged_bytes(), Ok(12));
         stream.state.received_ack_of(frame::StreamMeta {
             id: ids[0],
             offsets: 4..8,
             fin: false,
         });
         assert_eq!(
-            stream.acknowledged_offset(),
+            stream.acknowledged_bytes(),
             Ok(16),
-            "closing the hole includes the later ACK range"
+            "closing the hole counts each byte once"
         );
         stream.state.received_ack_of(frame::StreamMeta {
             id: ids[0],
@@ -2249,7 +2249,7 @@ mod tests {
             fin: true,
         });
         assert_eq!(
-            stream.acknowledged_offset(),
+            stream.acknowledged_bytes(),
             Err(crate::ClosedStream { _private: () })
         );
     }

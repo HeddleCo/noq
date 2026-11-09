@@ -271,17 +271,17 @@ impl SendStream {
         }
     }
 
-    /// Offset up to which all bytes on this stream have been acknowledged.
+    /// Number of uniquely acknowledged bytes on this stream.
     ///
-    /// This measures peer receipt, not application processing. Queued writes
-    /// and sibling streams do not advance it. After `finish`, the send state
-    /// may be freed; use `stopped` to observe completion or connection failure.
-    pub fn acknowledged_offset(&self) -> Result<u64, ClosedStream> {
+    /// This measures peer receipt, not application processing. Out-of-order ACKs
+    /// advance it; duplicate ACKs, queued writes and sibling streams do not.
+    /// After `finish`, the send state may be freed; use `stopped` to observe completion or connection failure.
+    pub fn acknowledged_bytes(&self) -> Result<u64, ClosedStream> {
         self.conn
-            .lock_without_waking("SendStream::acknowledged_offset")
+            .lock_without_waking("SendStream::acknowledged_bytes")
             .inner
             .send_stream(self.stream)
-            .acknowledged_offset()
+            .acknowledged_bytes()
     }
 
     /// Get the identity of this stream

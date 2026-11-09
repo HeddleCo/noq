@@ -311,13 +311,14 @@ impl<'a> SendStream<'a> {
         Ok(written)
     }
 
-    /// Offset up to which all bytes on this stream have been acknowledged.
+    /// Number of uniquely acknowledged bytes on this stream.
     ///
-    /// Queued writes and acknowledgements on other streams do not advance it.
+    /// Out-of-order ACKs count as progress; duplicate ACKs, queued writes and
+    /// acknowledgements on other streams do not.
     /// Returns `ClosedStream` after the stream's send state has been freed.
-    pub fn acknowledged_offset(&self) -> Result<u64, ClosedStream> {
+    pub fn acknowledged_bytes(&self) -> Result<u64, ClosedStream> {
         match self.state.send.get(&self.id) {
-            Some(Some(stream)) => Ok(stream.pending.fully_acked_offset()),
+            Some(Some(stream)) => Ok(stream.pending.offset() - stream.pending.unacked()),
             Some(None) => Ok(0),
             None => Err(ClosedStream { _private: () }),
         }
