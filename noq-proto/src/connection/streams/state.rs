@@ -2179,6 +2179,82 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_offset_is_per_stream_and_tracks_contiguous_acks() {
+        let mut state = make(Side::Client);
+        state.set_params(&TransportParameters {
+            initial_max_data: 1024u32.into(),
+            initial_max_stream_data_uni: 1024u32.into(),
+            initial_max_streams_uni: 2u32.into(),
+            ..TransportParameters::default()
+        });
+        let conn_state = ConnState::established();
+        let mut pending = Retransmits::default();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = Streams {
+                state: &mut state,
+                conn_state: &conn_state,
+            }
+            .open(Dir::Uni)
+            .unwrap();
+            let mut stream = SendStream {
+                id,
+                state: &mut state,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            assert_eq!(stream.acknowledged_offset(), Ok(0));
+            assert_eq!(stream.write(&[0; 16]), Ok(16));
+            stream.finish().unwrap();
+            assert_eq!(stream.acknowledged_offset(), Ok(0), "writes are not ACKs");
+            ids.push(id);
+        }
+        for (id, offsets) in [(ids[1], 0..8), (ids[0], 8..16)] {
+            state.received_ack_of(frame::StreamMeta {
+                id,
+                offsets,
+                fin: false,
+            });
+        }
+        let stream = SendStream {
+            id: ids[0],
+            state: &mut state,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        };
+        assert_eq!(
+            stream.acknowledged_offset(),
+            Ok(0),
+            "sibling ACKs and holes do not advance the offset"
+        );
+        stream.state.received_ack_of(frame::StreamMeta {
+            id: ids[0],
+            offsets: 0..4,
+            fin: false,
+        });
+        assert_eq!(stream.acknowledged_offset(), Ok(4));
+        stream.state.received_ack_of(frame::StreamMeta {
+            id: ids[0],
+            offsets: 4..8,
+            fin: false,
+        });
+        assert_eq!(
+            stream.acknowledged_offset(),
+            Ok(16),
+            "closing the hole includes the later ACK range"
+        );
+        stream.state.received_ack_of(frame::StreamMeta {
+            id: ids[0],
+            offsets: 16..16,
+            fin: true,
+        });
+        assert_eq!(
+            stream.acknowledged_offset(),
+            Err(crate::ClosedStream { _private: () })
+        );
+    }
+
+    #[test]
     fn expand_send_window() {
         let mut server = make(Side::Server);
 

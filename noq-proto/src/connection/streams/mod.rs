@@ -311,6 +311,18 @@ impl<'a> SendStream<'a> {
         Ok(written)
     }
 
+    /// Offset up to which all bytes on this stream have been acknowledged.
+    ///
+    /// Queued writes and acknowledgements on other streams do not advance it.
+    /// Returns `ClosedStream` after the stream's send state has been freed.
+    pub fn acknowledged_offset(&self) -> Result<u64, ClosedStream> {
+        match self.state.send.get(&self.id) {
+            Some(Some(stream)) => Ok(stream.pending.fully_acked_offset()),
+            Some(None) => Ok(0),
+            None => Err(ClosedStream { _private: () }),
+        }
+    }
+
     /// Check if this stream was stopped, get the reason if it was
     pub fn stopped(&self) -> Result<Option<VarInt>, ClosedStream> {
         match self.state.send.get(&self.id).as_ref() {

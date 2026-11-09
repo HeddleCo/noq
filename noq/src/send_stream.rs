@@ -271,6 +271,19 @@ impl SendStream {
         }
     }
 
+    /// Offset up to which all bytes on this stream have been acknowledged.
+    ///
+    /// This measures peer receipt, not application processing. Queued writes
+    /// and sibling streams do not advance it. After `finish`, the send state
+    /// may be freed; use `stopped` to observe completion or connection failure.
+    pub fn acknowledged_offset(&self) -> Result<u64, ClosedStream> {
+        self.conn
+            .lock_without_waking("SendStream::acknowledged_offset")
+            .inner
+            .send_stream(self.stream)
+            .acknowledged_offset()
+    }
+
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream

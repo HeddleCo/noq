@@ -327,7 +327,7 @@ impl SendBuffer {
     }
 
     /// Offset up to which all data has been acknowledged
-    fn fully_acked_offset(&self) -> u64 {
+    pub(super) fn fully_acked_offset(&self) -> u64 {
         self.data.range().start
     }
 
