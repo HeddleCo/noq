@@ -2981,26 +2981,6 @@ impl Connection {
         if ack.largest >= self.spaces[space].for_path(path).next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
-        // `Some(pn)` if this ACK raised `largest_acked_packet_pn`.
-        let new_largest_pn = {
-            let space = &mut self.spaces[space].for_path(path);
-            if space
-                .largest_acked_packet_pn
-                .is_none_or(|pn| ack.largest > pn)
-            {
-                space.largest_acked_packet_pn = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(ack.largest) {
-                    // This should always succeed, but a misbehaving peer might ACK a packet we
-                    // haven't sent. At worst, that will result in us spuriously reducing the
-                    // congestion window.
-                    space.largest_acked_packet_send_time = info.time_sent;
-                }
-                Some(ack.largest)
-            } else {
-                None
-            }
-        };
-
         if self.detect_spurious_loss(&ack, space, path) {
             self.path_stats.get_mut(path).spurious_congestion_events += 1;
             self.path_data_mut(path)
@@ -3038,6 +3018,22 @@ impl Connection {
             self.prune_late_streams(now);
             return Ok(());
         }
+
+        // Off-path probes are untracked: their ACKs cannot advance recovery or RTT.
+        let new_largest_pn = {
+            let space = &mut self.spaces[space].for_path(path);
+            if let Some(pn) = newly_acked
+                .max()
+                .filter(|&pn| space.largest_acked_packet_pn.is_none_or(|old| pn > old))
+                && let Some(info) = space.sent_packets.get(pn)
+            {
+                space.largest_acked_packet_send_time = info.time_sent;
+                space.largest_acked_packet_pn = Some(pn);
+                Some(pn)
+            } else {
+                None
+            }
+        };
 
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
@@ -7166,6 +7162,7 @@ impl Connection {
                 .for_path(path)
                 .largest_acked_packet_pn
                 .unwrap_or(0),
+            self.n0_nat_traversal.is_negotiated(),
         )
         .len();
 

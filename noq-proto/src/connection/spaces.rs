@@ -903,20 +903,16 @@ impl ThinRetransmits {
     }
 }
 
-/// RFC4303-style sliding window packet number deduplicator.
+/// Exact replay tracking above a bounded retention floor.
 ///
-/// A contiguous bitfield, where each bit corresponds to a packet number and the rightmost bit is
-/// always set. A set bit represents a packet that has been successfully authenticated. Bits left of
-/// the window are assumed to be set.
-///
-/// ```text
-/// ...xxxxxxxxx 1 0
-///     ^        ^ ^
-/// window highest next
-/// ```
+/// The newest 129 PNs use a bitmap. Older received PNs live in at most 32 ranges;
+/// evicting the oldest range raises the floor, never admitting a replay.
 #[derive(Debug, Default)]
 pub(super) struct Dedup {
     window: Window,
+    /// Packet numbers below this inclusive retention floor are discarded.
+    floor: u64,
+    older: ArrayRangeSet,
     /// Lowest packet number higher than all yet authenticated.
     next: u64,
 }
@@ -925,7 +921,7 @@ impl Dedup {
     /// Construct an empty window positioned at the start.
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self { window: 0, next: 0 }
+        Self::default()
     }
 
     /// Highest packet number authenticated.
@@ -937,7 +933,18 @@ impl Dedup {
     ///
     /// Returns whether the packet might be a duplicate.
     pub(super) fn insert(&mut self, packet: u64) -> bool {
+        if packet < self.floor {
+            return true;
+        }
         if let Some(diff) = packet.checked_sub(self.next) {
+            // Fold only authenticated bits leaving the bitmap into older ranges.
+            let low = packet.saturating_sub(WINDOW_SIZE - 1);
+            for old in self.next.saturating_sub(WINDOW_SIZE)..self.next.min(low) {
+                let offset = self.highest() - old;
+                if offset == 0 || self.window & (1 << (offset - 1)) != 0 {
+                    self.remember(old);
+                }
+            }
             // Right of window
             self.window = ((self.window << 1) | 1)
                 .checked_shl(cmp::min(diff, u64::from(u32::MAX)) as u32)
@@ -957,9 +964,19 @@ impl Dedup {
                 true
             }
         } else {
-            // Left of window
-            true
+            // Left of window, but still above the retention floor.
+            self.remember(packet)
         }
+    }
+
+    fn remember(&mut self, packet: u64) -> bool {
+        let duplicate = !self.older.insert_one(packet);
+        if (self.older.range_count() > 32 || self.older.min() == Some(self.floor))
+            && let Some(oldest) = self.older.pop_min()
+        {
+            self.floor = oldest.end;
+        }
+        duplicate
     }
 
     /// Returns the packet number of the smallest packet missing between the provided interval
@@ -973,22 +990,32 @@ impl Dedup {
         // Since we already know the packets at the boundaries have been received, we only need to
         // check those in between them (this removes the necessity of extra logic to deal with the
         // highest packet, which is stored outside the bitfield)
-        let lower_bound = lower_bound + 1;
+        let mut lower_bound = (lower_bound + 1).max(self.floor);
         let upper_bound = upper_bound.saturating_sub(1);
+        for range in self.older.iter() {
+            if range.start > lower_bound {
+                break;
+            }
+            lower_bound = lower_bound.max(range.end);
+        }
+        if lower_bound > upper_bound {
+            return None;
+        }
+        if lower_bound < self.next.saturating_sub(WINDOW_SIZE) {
+            return Some(lower_bound);
+        }
 
         // Note: the offsets are counted from the right
         // The highest packet is not included in the bitfield, so we subtract 1 to account for that
         let start_offset = (self.highest() - upper_bound).max(1) - 1;
         if start_offset >= BITFIELD_SIZE {
-            // The start offset is outside of the window. All packets outside of the window are
-            // considered to be received.
+            // Older missing packets were checked against the ranges and floor above.
             return None;
         }
 
         let end_offset_exclusive = self.highest().saturating_sub(lower_bound);
 
-        // The range is clamped at the edge of the window, because any earlier packets are
-        // considered to be received
+        // Older packet numbers have already been checked above.
         let range_len = end_offset_exclusive
             .saturating_sub(start_offset)
             .min(BITFIELD_SIZE);
@@ -1423,6 +1450,48 @@ mod test {
 
     use super::*;
 
+    proptest::proptest! {
+        #[test]
+        fn dedup_exact_set_and_floor(ops in proptest::collection::vec(0u64..8192, 0..400)) {
+            use crate::HashSet;
+            let mut dedup = Dedup::new();
+            let mut seen = HashSet::new();
+            let mut floor = 0;
+            let mut next = 0;
+            // More than 32 separated ranges, then an eviction of the entire bitmap.
+            let prelude = (0..80).map(|n| n * 2).chain([2048, 1, 40, 159, 2048]);
+            for pn in prelude.chain(ops) {
+                let duplicate = pn < floor || seen.contains(&pn);
+                proptest::prop_assert_eq!(dedup.insert(pn), duplicate);
+                if !duplicate { seen.insert(pn); next = next.max(pn + 1); }
+                // Independent HashSet oracle: derive maximal runs of received old PNs.
+                let mut old: Vec<_> = seen.iter().copied()
+                    .filter(|n| *n >= floor && *n < next.saturating_sub(129)).collect();
+                old.sort_unstable();
+                let mut runs: Vec<Range<u64>> = Vec::new();
+                for n in old {
+                    if let Some(run) = runs.last_mut().filter(|run| run.end == n) { run.end += 1; }
+                    else { runs.push(n..n+1); }
+                }
+                while runs.len() > 32 || runs.first().is_some_and(|r| r.start == floor) {
+                    floor = runs.remove(0).end;
+                }
+                proptest::prop_assert_eq!(dedup.floor, floor);
+                proptest::prop_assert!(dedup.older.range_count() <= 32);
+                let high = next - 1;
+                let lower = seen.iter().copied().filter(|n| *n >= floor).min().unwrap_or(high);
+                let middle = seen.iter().copied().filter(|n| *n >= floor && *n <= pn).max().unwrap_or(lower);
+                for bound in [lower, middle, high] {
+                    let missing = (bound+1..high).find(|n| *n >= floor && !seen.contains(n));
+                    proptest::prop_assert_eq!(dedup.smallest_missing_in_interval(bound, high), missing);
+                }
+                // Replays on both sides of the floor must always be rejected.
+                proptest::prop_assert!(dedup.insert(pn));
+            }
+            proptest::prop_assert!(floor >= 95, "the cap fold must have been exercised");
+        }
+    }
+
     #[test]
     fn sanity() {
         let mut dedup = Dedup::new();
@@ -1471,7 +1540,7 @@ mod test {
     fn jump() {
         let mut dedup = Dedup::new();
         dedup.insert(2 * WINDOW_SIZE);
-        assert!(dedup.insert(WINDOW_SIZE));
+        assert!(!dedup.insert(WINDOW_SIZE));
         assert_eq!(dedup.next, 2 * WINDOW_SIZE + 1);
         assert_eq!(dedup.window, 0);
         assert!(!dedup.insert(WINDOW_SIZE + 1));
@@ -1537,12 +1606,12 @@ mod test {
         dedup.insert(170);
         dedup.insert(172);
         dedup.insert(300);
-        assert_eq!(dedup.smallest_missing_in_interval(170, 172), None);
+        assert_eq!(dedup.smallest_missing_in_interval(170, 172), Some(171));
 
         dedup.insert(500);
-        assert_eq!(dedup.smallest_missing_in_interval(0, 500), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 373), Some(372));
-        assert_eq!(dedup.smallest_missing_in_interval(0, 372), None);
+        assert_eq!(dedup.smallest_missing_in_interval(0, 500), Some(3));
+        assert_eq!(dedup.smallest_missing_in_interval(0, 373), Some(3));
+        assert_eq!(dedup.smallest_missing_in_interval(0, 372), Some(3));
     }
 
     #[test]

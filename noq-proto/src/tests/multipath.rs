@@ -2351,10 +2351,10 @@ fn mixed_route_stream(short_prefix: bool) -> TestResult {
     pair.send_stream(Client, stream).finish()?;
     for _ in 0..10000 {
         pair.drive_client();
-        if let Routing::MixedRoute(route) = &pair.routes {
-            if route.departures.len() > 300 {
-                break;
-            }
+        if let Routing::MixedRoute(route) = &pair.routes
+            && route.departures.len() > 300
+        {
+            break;
         }
         assert!(pair.step());
     }
