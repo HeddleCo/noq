@@ -4361,6 +4361,10 @@ impl Connection {
             Err(None) => {
                 debug!("failed to authenticate packet");
                 self.authentication_failures += 1;
+                #[cfg(test)]
+                {
+                    self.partial_stats.authentication_drops += 1;
+                }
                 let integrity_limit = self
                     .crypto_state
                     .integrity_limit(self.highest_space)
@@ -4420,6 +4424,10 @@ impl Connection {
                     .map(|pns| &mut pns.dedup);
                 if pn.zip(dedup).is_some_and(|(n, d)| d.insert(n)) {
                     debug!("discarding possible duplicate packet");
+                    #[cfg(test)]
+                    {
+                        self.partial_stats.duplicate_discards += 1;
+                    }
                     self.qlog.emit_packet_received(qlog, now);
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {

@@ -2298,3 +2298,133 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn off_path_probe_overtakes_queued_stream() -> TestResult {
+    mixed_route_stream(false)
+}
+
+#[test]
+fn off_path_probe_overtakes_short_packet_numbers() -> TestResult {
+    mixed_route_stream(true)
+}
+
+fn mixed_route_stream(short_prefix: bool) -> TestResult {
+    use super::util::{MixedRouteRouting, Routing};
+    use crate::congestion::CubicConfig;
+    const LEN: usize = 2 * 1024 * 1024;
+    let mut cc = CubicConfig::default();
+    cc.initial_window(4 * 1024 * 1024);
+    let mut cfg = TransportConfig::default();
+    cfg.congestion_controller_factory(Arc::new(cc));
+    cfg.deterministic_packet_numbers(true);
+    cfg.send_window(4 * 1024 * 1024);
+    cfg.stream_receive_window((4 * 1024 * 1024u32).into());
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(cfg)
+        .enable_multipath()
+        .enable_nat_traversal()
+        .disable_mtud_discovery()
+        .with_routes(MixedRouteRouting::default())
+        .connect();
+    pair.add_nat_traversal_address(Server, MixedRouteRouting::DIRECT)?;
+    pair.add_nat_traversal_address(Client, Pair::CLIENT_ADDR)?;
+    pair.drive();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    if let Routing::MixedRoute(route) = &mut pair.routes {
+        route.shaped = true;
+    }
+    // This prefix is encoded before the outstanding flight forces a wider PN.
+    let prefix = if short_prefix { 1200 } else { 0 };
+    if prefix != 0 {
+        assert_eq!(
+            pair.send_stream(Client, stream).write(&vec![42; prefix])?,
+            prefix
+        );
+        pair.drive_client();
+    }
+    assert_eq!(
+        pair.send_stream(Client, stream)
+            .write(&vec![42; LEN - prefix])?,
+        LEN - prefix
+    );
+    pair.send_stream(Client, stream).finish()?;
+    for _ in 0..10000 {
+        pair.drive_client();
+        if let Routing::MixedRoute(route) = &pair.routes {
+            if route.departures.len() > 300 {
+                break;
+            }
+        }
+        assert!(pair.step());
+    }
+    let Routing::MixedRoute(route) = &pair.routes else {
+        unreachable!()
+    };
+    assert!(
+        route.departures.len() > 300,
+        "FIFO must hold more than 300 packets"
+    );
+    assert_eq!(
+        pair.initiate_nat_traversal_round(Client)?,
+        vec![MixedRouteRouting::DIRECT]
+    );
+    let mut received = 0;
+    let mut ended = false;
+    let mut acked = false;
+    for _ in 0..100000 {
+        pair.step();
+        pair.streams(Server).accept(Dir::Uni);
+        if let Ok(mut chunks) = pair.recv_stream(Server, stream).read(false) {
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => {
+                        assert!(chunk.bytes.iter().all(|byte| *byte == 42));
+                        received += chunk.bytes.len();
+                    }
+                    Ok(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(crate::ReadError::Blocked) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = chunks.finalize();
+        }
+        while let Some(event) = pair.conn_mut(Client).poll() {
+            if matches!(event, Event::Stream(StreamEvent::Finished { id }) if id == stream) {
+                acked = true;
+            }
+        }
+        if ended && acked {
+            break;
+        }
+    }
+    let server = pair.stats(Server);
+    let path = pair.path_stats(Client, PathId::ZERO).unwrap();
+    std::eprintln!(
+        "mixed route short_prefix={short_prefix} duplicate_discards={} authentication_drops={} lost_packets={} congestion_events={} received={received}",
+        server.duplicate_discards,
+        server.authentication_drops,
+        path.lost_packets,
+        path.congestion_events
+    );
+    assert_eq!(
+        server.duplicate_discards, 0,
+        "queued packets discarded as duplicates"
+    );
+    assert_eq!(
+        server.authentication_drops, 0,
+        "queued packet PN expansion failed authentication"
+    );
+    assert_eq!(
+        path.lost_packets, 0,
+        "probe ACK declared queued packets lost"
+    );
+    assert_eq!(path.congestion_events, 0);
+    assert_eq!(received, LEN);
+    assert!(ended);
+    assert!(acked, "the complete stream and FIN must be acknowledged");
+    Ok(())
+}

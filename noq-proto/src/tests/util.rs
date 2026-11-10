@@ -1719,6 +1719,7 @@ pub(super) enum Routing {
     SimpleFirewall(SimpleFirewallRouting),
     ManyToMany(ManyToManyRouting),
     BwLimited(BwLimitedRouting),
+    MixedRoute(MixedRouteRouting),
 }
 
 impl Routing {
@@ -1731,6 +1732,7 @@ impl Routing {
             Self::SimpleFirewall(inner) => inner.public_server_addr(),
             Self::ManyToMany(inner) => inner.public_server_addr(),
             Self::BwLimited(inner) => inner.public_server_addr(),
+            Self::MixedRoute(_) => Pair::SERVER_ADDR,
         }
     }
 
@@ -1741,6 +1743,7 @@ impl Routing {
             Self::SimpleFirewall(inner) => inner.route_client_to_server(transmit, now),
             Self::ManyToMany(inner) => inner.route_client_to_server(transmit, now),
             Self::BwLimited(inner) => inner.route_client_to_server(transmit, now),
+            Self::MixedRoute(inner) => inner.route_client_to_server(transmit, now),
         }
     }
     /// Routes a datagram from server to client.
@@ -1750,6 +1753,7 @@ impl Routing {
             Self::SimpleFirewall(inner) => inner.route_server_to_client(transmit, now),
             Self::ManyToMany(inner) => inner.route_server_to_client(transmit, now),
             Self::BwLimited(inner) => inner.route_server_to_client(transmit, now),
+            Self::MixedRoute(inner) => inner.route_server_to_client(transmit, now),
         }
     }
 
@@ -1776,6 +1780,7 @@ impl Routing {
             }
             Self::ManyToMany(many_to_many_routing) => many_to_many_routing.set_latency(latency),
             Self::BwLimited(bw_limited_routing) => bw_limited_routing.set_latency(latency),
+            Self::MixedRoute(inner) => inner.latency = latency,
         }
     }
 }
@@ -2475,5 +2480,67 @@ impl Limiter {
         let experienced_congestion = self.finished_sending_at > now + self.max_queue / 2;
 
         Some((self.finished_sending_at, experienced_congestion))
+    }
+}
+
+/// Lossless FIFO to A; B is a second address on the same server reached directly.
+#[derive(Debug)]
+pub(super) struct MixedRouteRouting {
+    pub(super) shaped: bool,
+    pub(super) departures: VecDeque<Instant>,
+    latency: Duration,
+}
+
+impl Default for MixedRouteRouting {
+    fn default() -> Self {
+        Self {
+            shaped: false,
+            departures: VecDeque::new(),
+            latency: Duration::from_millis(100),
+        }
+    }
+}
+
+impl MixedRouteRouting {
+    pub(super) const DIRECT: SocketAddr =
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 2, 2)), 1);
+
+    fn route_client_to_server(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
+        let recv_time = if transmit.destination == Pair::SERVER_ADDR {
+            while self.departures.front().is_some_and(|time| *time <= now) {
+                self.departures.pop_front();
+            }
+            let departure = if self.shaped {
+                self.departures.back().copied().unwrap_or(now).max(now) + Duration::from_micros(100)
+            } else {
+                now
+            };
+            self.departures.push_back(departure);
+            departure + self.latency
+        } else {
+            assert_eq!(transmit.destination, Self::DIRECT);
+            now
+        };
+        RoutingDecision::Deliver {
+            src: Pair::CLIENT_ADDR,
+            dst: Some(transmit.destination.ip()),
+            recv_time,
+            congestion_experienced: false,
+        }
+    }
+
+    fn route_server_to_client(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
+        RoutingDecision::Deliver {
+            src: Pair::SERVER_ADDR,
+            dst: Some(transmit.destination.ip()),
+            recv_time: now + self.latency,
+            congestion_experienced: false,
+        }
+    }
+}
+
+impl From<MixedRouteRouting> for Routing {
+    fn from(value: MixedRouteRouting) -> Self {
+        Self::MixedRoute(value)
     }
 }
