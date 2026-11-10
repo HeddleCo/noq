@@ -9,6 +9,7 @@ fn delayed_stream_packet(
     ConnectionHandle,
     ConnectionHandle,
     crate::StreamId,
+    crate::StreamId,
     util::InboundQueue,
 ) {
     let mut pair = Pair::default_with_deterministic_pns();
@@ -16,6 +17,7 @@ fn delayed_stream_packet(
     pair.drive();
     pair.routes.set_latency(Duration::ZERO);
     let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    let sibling = pair.client_streams(client).open(Dir::Uni).unwrap();
     pair.client_send(client, stream)
         .write(b"late receipt")
         .unwrap();
@@ -33,18 +35,18 @@ fn delayed_stream_packet(
     pair.drive_server();
     pair.drive_client();
     assert!(pair.client_conn_mut(client).stats().lost_packets > 0);
+    assert!(pair.client_conn_mut(client).stats().frame_tx.stream >= 2);
     let retransmissions = mem::take(&mut pair.server.inbound);
     pair.server.inbound = delayed;
     pair.drive_server();
     pair.drive_client();
-    (pair, client, server, stream, retransmissions)
+    (pair, client, server, stream, sibling, retransmissions)
 }
 
 #[test]
 fn late_packet_ack_credits_unique_bytes_only_on_its_stream() {
     let _guard = subscribe();
-    let (mut pair, client, _, stream, retransmissions) = delayed_stream_packet(false);
-    let sibling = pair.client_streams(client).open(Dir::Uni).unwrap();
+    let (mut pair, client, _, stream, sibling, retransmissions) = delayed_stream_packet(false);
     assert_eq!(
         pair.client_send(client, stream).acknowledged_bytes(),
         Ok(12)
@@ -68,7 +70,7 @@ fn late_packet_ack_credits_unique_bytes_only_on_its_stream() {
 #[test]
 fn late_packet_ack_keeps_the_recovery_decisions() {
     let _guard = subscribe();
-    let (mut pair, client, _, _, retransmissions) = delayed_stream_packet(false);
+    let (mut pair, client, _, _, _, retransmissions) = delayed_stream_packet(false);
     let stats = pair
         .client_conn_mut(client)
         .path_stats(PathId::ZERO)
@@ -89,7 +91,7 @@ fn late_packet_ack_keeps_the_recovery_decisions() {
 #[test]
 fn late_packet_ack_of_fin_completes_before_queued_retransmission() {
     let _guard = subscribe();
-    let (mut pair, client, _, stream, _) = delayed_stream_packet(true);
+    let (mut pair, client, _, stream, _, _) = delayed_stream_packet(true);
     assert_matches!(pair.client_conn_mut(client).poll(),
         Some(Event::Stream(StreamEvent::Finished { id })) if id == stream);
 }
