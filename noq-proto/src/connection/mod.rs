@@ -2836,6 +2836,11 @@ impl Connection {
         self.path(path_id).map(|d| d.rtt.get())
     }
 
+    /// Unbacked-off data PTO, using the largest current path RTT estimate and peer ACK delay.
+    pub fn base_pto(&self) -> Duration {
+        self.max_pto_for_space(SpaceKind::Data)
+    }
+
     /// Current state of this connection's congestion controller, for debugging purposes
     pub fn congestion_state(&self, path_id: PathId) -> Option<&dyn Controller> {
         self.path(path_id).map(|d| d.congestion.as_ref())
@@ -4711,6 +4716,7 @@ impl Connection {
                         .remove_in_flight(&info);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
+                self.late_streams.clear();
                 self.streams.retransmit_all_for_0rtt();
 
                 let token_len = packet.payload.len() - 16;
@@ -4772,6 +4778,7 @@ impl Connection {
                             debug!("0-RTT rejected");
                             self.crypto_state.accepted_0rtt = false;
                             self.streams.zero_rtt_rejected();
+                            self.late_streams.clear();
 
                             // Discard already-queued frames
                             self.spaces[SpaceId::Data].pending = Retransmits::default();

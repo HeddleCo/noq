@@ -4,6 +4,7 @@ use crate::ConnectionHandle;
 
 fn delayed_stream_packet(
     finish: bool,
+    expire: bool,
 ) -> (
     Pair,
     ConnectionHandle,
@@ -37,6 +38,10 @@ fn delayed_stream_packet(
     assert!(pair.client_conn_mut(client).stats().lost_packets > 0);
     assert!(pair.client_conn_mut(client).stats().frame_tx.stream >= 2);
     let retransmissions = mem::take(&mut pair.server.inbound);
+    if expire {
+        let retention = 3 * pair.client_conn_mut(client).base_pto();
+        pair.time += retention;
+    }
     pair.server.inbound = delayed;
     pair.drive_server();
     pair.drive_client();
@@ -46,7 +51,8 @@ fn delayed_stream_packet(
 #[test]
 fn late_packet_ack_credits_unique_bytes_only_on_its_stream() {
     let _guard = subscribe();
-    let (mut pair, client, _, stream, sibling, retransmissions) = delayed_stream_packet(false);
+    let (mut pair, client, _, stream, sibling, retransmissions) =
+        delayed_stream_packet(false, false);
     assert_eq!(
         pair.client_send(client, stream).acknowledged_bytes(),
         Ok(12)
@@ -70,7 +76,7 @@ fn late_packet_ack_credits_unique_bytes_only_on_its_stream() {
 #[test]
 fn late_packet_ack_keeps_the_recovery_decisions() {
     let _guard = subscribe();
-    let (mut pair, client, _, _, _, retransmissions) = delayed_stream_packet(false);
+    let (mut pair, client, _, _, _, retransmissions) = delayed_stream_packet(false, false);
     let stats = pair
         .client_conn_mut(client)
         .path_stats(PathId::ZERO)
@@ -84,14 +90,27 @@ fn late_packet_ack_keeps_the_recovery_decisions() {
         stats.frame_tx.stream,
         retransmissions.len(),
     );
-    std::eprintln!("RECOVERY_PIN {recovery:?}");
-    assert!(stats.lost_packets > 0);
+    // Recorded with the late-ACK fix reverted: recovery must stay identical.
+    assert_eq!(recovery, (12000, 1, 41, 1, 1, 2, 1));
 }
 
 #[test]
 fn late_packet_ack_of_fin_completes_before_queued_retransmission() {
     let _guard = subscribe();
-    let (mut pair, client, _, stream, _, _) = delayed_stream_packet(true);
+    let (mut pair, client, _, stream, _, _) = delayed_stream_packet(true, false);
     assert_matches!(pair.client_conn_mut(client).poll(),
         Some(Event::Stream(StreamEvent::Finished { id })) if id == stream);
+}
+
+#[test]
+fn late_packet_metadata_expires_after_three_base_ptos() {
+    let _guard = subscribe();
+    let (mut pair, client, _, stream, _, retransmissions) = delayed_stream_packet(false, true);
+    assert_eq!(pair.client_send(client, stream).acknowledged_bytes(), Ok(0));
+    pair.server.inbound = retransmissions;
+    pair.drive();
+    assert_eq!(
+        pair.client_send(client, stream).acknowledged_bytes(),
+        Ok(12)
+    );
 }
