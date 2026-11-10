@@ -177,6 +177,8 @@ pub struct Connection {
     /// deterministically select the next PathId to send on.
     // TODO(flub): well does it really? But deterministic is nice for now.
     paths: BTreeMap<PathId, PathState>,
+    /// Stream metadata only, eligible for late ACKs until three base PTOs after loss.
+    late_streams: BTreeMap<(SpaceId, PathId, u64), (Instant, frame::StreamMetaVec)>,
     /// Counter to uniquely identify every [`PathData`] created in this connection.
     ///
     /// Each [`PathData`] gets a [`PathData::generation`] that is unique among all
@@ -385,6 +387,7 @@ impl Connection {
                 },
             )]),
             path_generation_counter: 0,
+            late_streams: BTreeMap::new(),
             allow_mtud,
             state,
             side: connection_side,
@@ -463,7 +466,11 @@ impl Connection {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.timers.peek()
+        self.timers
+            .peek()
+            .into_iter()
+            .chain(self.late_streams.values().map(|(expires, _)| *expires))
+            .min()
     }
 
     /// Returns the instant at which `timer` is armed to fire, or `None` if it is not.
@@ -2468,6 +2475,7 @@ impl Connection {
     /// `Instant` that was output by `poll_timeout`; however spurious extra calls will simply
     /// no-op and therefore are safe.
     pub fn handle_timeout(&mut self, now: Instant) {
+        self.prune_late_streams(now);
         while let Some((timer, _time)) = self.timers.expire_before(now, &self.qlog) {
             let span = match timer {
                 Timer::Conn(timer) => trace_span!("timeout", scope = "conn", ?timer),
@@ -2997,8 +3005,21 @@ impl Connection {
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked: ArrayRangeSet = ArrayRangeSet::new();
+        self.prune_late_streams(now);
         for range in ack.iter() {
             self.spaces[space].for_path(path).check_ack(range.clone())?;
+            let late: Vec<_> = self
+                .late_streams
+                .range((space, path, range.start)..(space, path, range.end))
+                .map(|(key, _)| *key)
+                .collect();
+            for key in late {
+                if let Some((_, frames)) = self.late_streams.remove(&key) {
+                    for frame in frames {
+                        self.streams.received_ack_of(frame);
+                    }
+                }
+            }
             for (pn, _) in self.spaces[space]
                 .for_path(path)
                 .sent_packets
@@ -3009,6 +3030,7 @@ impl Connection {
         }
 
         if newly_acked.is_empty() {
+            self.prune_late_streams(now);
             return Ok(());
         }
 
@@ -3120,8 +3142,16 @@ impl Connection {
             }
         }
 
+        self.prune_late_streams(now);
         self.set_loss_detection_timer(now, path);
         Ok(())
+    }
+
+    fn prune_late_streams(&mut self, now: Instant) {
+        self.late_streams.retain(|_, (expires, frames)| {
+            frames.retain(|frame| !self.streams.is_acknowledged(frame));
+            now < *expires && !frames.is_empty()
+        });
     }
 
     fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId, path: PathId) -> bool {
@@ -3482,6 +3512,7 @@ impl Connection {
         debug_assert!(lost_packets.is_sorted(), "lost_packets must be sorted");
 
         self.drain_lost_packets(now, pn_space, path_id);
+        self.prune_late_streams(now);
 
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
@@ -3513,8 +3544,13 @@ impl Connection {
                     .unwrap()
                     .remove_in_flight(&info);
 
-                for frame in info.stream_frames {
+                for frame in info.stream_frames.iter().cloned() {
                     self.streams.retransmit(frame);
+                }
+                if !info.stream_frames.is_empty() {
+                    let expires = now + 3 * self.pto(pn_space.kind(), path_id);
+                    self.late_streams
+                        .insert((pn_space, path_id, packet), (expires, info.stream_frames));
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);

@@ -605,8 +605,10 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
-        if !stream.ack(frame) {
+        let unacked = stream.pending.unacked();
+        let finished = stream.ack(frame);
+        self.unacked_data -= unacked - stream.pending.unacked();
+        if !finished {
             // The stream is unfinished or may still need retransmits
             return;
         }
@@ -626,6 +628,18 @@ impl StreamsState {
         }
         stream.fin_pending |= frame.fin;
         stream.pending.retransmit(frame.offsets);
+    }
+
+    pub(crate) fn is_acknowledged(&self, frame: &frame::StreamMeta) -> bool {
+        self.send
+            .get(&frame.id)
+            .and_then(Option::as_ref)
+            .is_none_or(|stream| {
+                stream.is_reset()
+                    || (stream.pending.is_acknowledged(frame.offsets.clone())
+                        && (!frame.fin
+                            || matches!(stream.state, SendState::DataSent { finish_acked: true })))
+            })
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {
