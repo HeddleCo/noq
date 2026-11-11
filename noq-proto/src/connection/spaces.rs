@@ -65,7 +65,7 @@ impl LateStreams {
     }
     pub(super) fn acknowledged(&mut self, frame: &frame::StreamMeta, streams: &StreamsState) {
         let range = streams.acknowledged_range(frame);
-        let keys: Vec<_> = self
+        let keys: BTreeSet<_> = self
             .streams
             .range((frame.id, range.start, (SpaceId::Initial, PathId::ZERO, 0))..)
             .take_while(|(id, end, _)| *id == frame.id && *end <= range.end)
