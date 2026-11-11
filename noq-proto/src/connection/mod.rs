@@ -3326,7 +3326,7 @@ impl Connection {
             // A path that predates the update and has not delivered a newer packet may still
             // be queueing older ones: keep the keys until it does, or the cap.
             deadline = match ends.values().any(Option::is_none) {
-                true => deadline.min(cap), // Negative control: pending paths do not extend retention.
+                true => cap,
                 false => deadline.min(cap),
             };
         }

@@ -13,7 +13,8 @@ use testresult::TestResult;
 use crate::connection::timer::{ConnTimer, Timer};
 use crate::crypto::{CryptoError, PacketKey};
 use crate::{
-    ConnectionError, Event, Instant, PathId, Side::*, TransportConfig, TransportErrorCode,
+    ConnectionError, Event, FourTuple, Instant, PathId, PathStatus, Side::*, TransportConfig,
+    TransportErrorCode,
 };
 
 use super::util::{ConnPair, Inbound, server_config};
@@ -85,6 +86,7 @@ fn observe(key: &mut Box<dyn PacketKey>, limit: u64) -> Arc<AtomicUsize> {
 
 struct Flight {
     pair: ConnPair,
+    fast: PathId,
     old: Vec<Inbound>,
     current: Inbound,
     first: Instant,
@@ -101,6 +103,7 @@ impl Flight {
         cfg.mtu_discovery_config(None);
         cfg.congestion_controller_factory(Arc::new(cc));
         cfg.initial_key_phase_size(Some(u64::MAX));
+        cfg.max_concurrent_multipath_paths(2);
         // Only the client proposes an idle timeout. The server must use the negotiated
         // value even though its local timeout is disabled.
         let mut server_transport = cfg.clone();
@@ -113,6 +116,13 @@ impl Flight {
             .with_latency(Duration::from_millis(500))
             .disable_mtud_discovery()
             .connect();
+        // Confirm the update on a second path while path 0's genuine old flight stays silent.
+        let fast = pair.open_path(
+            Client,
+            FourTuple::from_remote(pair.routes.public_server_addr()),
+            PathStatus::Backup,
+        )?;
+        pair.drive();
         let key = &mut pair.conn_mut(Server).packet_keys_for_test().remote;
         let dropped = observe(key, u64::MAX);
         let mut old = Vec::new();
@@ -126,7 +136,7 @@ impl Flight {
         }
         assert!(old.len() >= 40, "enough old packets for the 30 s cap");
         pair.force_key_update(Client);
-        pair.conn_mut(Client).ping();
+        pair.conn_mut(Client).ping_path(fast)?;
         pair.drive_client();
         pair.time += Duration::from_millis(500);
         pair.drive_server();
@@ -141,6 +151,7 @@ impl Flight {
         pair.server.inbound.clear();
         Ok(Self {
             pair,
+            fast,
             old,
             current,
             first,
@@ -201,8 +212,10 @@ fn key_retention_further_phase_change_discards_previous() -> TestResult {
     // Our existing update guard forbids another local phase change until discard.
     flight.pair.force_key_update(Server);
     assert_eq!(flight.dropped.load(Ordering::SeqCst), 0);
-    // Confirm the client's first update, then expire only its retention. Genuine old
-    // packets extend the server's retention past the client's independent deadline.
+    // Resolve both client paths, then expire only its retention. The server's path 0
+    // is still pending, so its old keys survive the client's independent deadline.
+    flight.pair.conn_mut(Server).ping_path(PathId::ZERO)?;
+    flight.pair.conn_mut(Server).ping_path(flight.fast)?;
     flight.pair.time += Duration::from_millis(500);
     flight.pair.drive_server();
     flight.pair.time += Duration::from_millis(500);
@@ -217,10 +230,16 @@ fn key_retention_further_phase_change_discards_previous() -> TestResult {
     let packet = flight.old.remove(0);
     flight.deliver(last_old, packet);
     assert!(flight.pair.datagrams(Server).recv().is_some());
+    // Confirm phase one on the slow path before phase two can overtake it there.
+    flight.deliver(last_old, flight.current.clone());
+    assert_eq!(
+        flight.pair.datagrams(Server).recv().unwrap(),
+        b"current"[..]
+    );
     flight.pair.time = client_deadline;
     flight.pair.conn_mut(Client).handle_timeout(client_deadline);
     flight.pair.force_key_update(Client);
-    flight.pair.conn_mut(Client).ping();
+    flight.pair.conn_mut(Client).ping_path(flight.fast)?;
     flight.pair.drive_client();
     flight.pair.time += Duration::from_millis(500);
     flight.pair.drive_server();

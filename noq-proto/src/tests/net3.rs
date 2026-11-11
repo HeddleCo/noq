@@ -114,6 +114,8 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
     let mut cfg = TransportConfig::default();
     cfg.congestion_controller_factory(Arc::new(cc));
     cfg.deterministic_packet_numbers(true);
+    // iroh keeps every path alive at 5 s, so each live path carries a packet in every phase.
+    cfg.default_path_keep_alive_interval(Some(Duration::from_secs(5)));
     let mut builder = ConnPair::builder()
         .with_transport_cfg(cfg)
         .enable_multipath()
@@ -316,11 +318,16 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
             }
             changed = true;
         }
+        let before = pair.time;
         let active = pair.step();
-        if boundary.is_none() {
-            boundary = pair
+        if boundary.is_none()
+            && pair
                 .conn(!c.initiator)
-                .timer_pending(Timer::Conn(ConnTimer::KeyDiscard));
+                .timer_pending(Timer::Conn(ConnTimer::KeyDiscard))
+                .is_some()
+        {
+            // The RFC 9001 § 6.5 deadline: 3 × PTO after the first new-phase packet.
+            boundary = Some(before + pair.conn(!c.initiator).base_pto() * 3);
         }
         for (side, stream, bytes, fin, acked) in &mut streams {
             let receiver = !*side;
@@ -364,12 +371,12 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
     // these timer events before testing the second update and the retention cap.
     let discard = Timer::Conn(ConnTimer::KeyDiscard);
     for side in [Client, Server] {
-        if let Some(deadline) = pair.conn(side).timer_pending(discard) {
+        if pair.conn(side).timer_pending(discard).is_some() {
+            pair.drive_until_timer(side, discard);
             assert!(
-                deadline <= start + Duration::from_secs(30),
+                pair.time <= start + Duration::from_secs(30),
                 "seed={seed}: key retention cap"
             );
-            pair.drive_until_timer(side, discard);
         }
     }
     if matches!(c.timing, Timing::After) || c.second {
