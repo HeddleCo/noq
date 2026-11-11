@@ -39,10 +39,12 @@ pub(crate) enum ConnTimer {
     ///
     /// Fires at initial PTO intervals to retransmit probes that got no PATH_RESPONSE.
     NatTraversalProbeRetry = 6,
+    /// Expire retained stream metadata for late packet ACKs.
+    LateStreams = 7,
 }
 
 impl ConnTimer {
-    const VALUES: [Self; 7] = [
+    const VALUES: [Self; 8] = [
         Self::Idle,
         Self::Close,
         Self::KeyDiscard,
@@ -50,6 +52,7 @@ impl ConnTimer {
         Self::PushNewCid,
         Self::NoAvailablePath,
         Self::NatTraversalProbeRetry,
+        Self::LateStreams,
     ];
 }
 

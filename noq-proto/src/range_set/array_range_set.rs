@@ -1,5 +1,4 @@
 use core::{
-    cmp::Ordering,
     fmt::{self, Write},
     iter::Sum,
     ops::{Add, Range, Sub},
@@ -91,18 +90,12 @@ where
     }
 
     pub(crate) fn contains(&self, x: T) -> bool {
-        self.0
-            .binary_search_by(|range| {
-                if range.end <= x {
-                    Ordering::Less
-                } else if x < range.start {
-                    Ordering::Greater
-                } else {
-                    // range.start <= x < range.end
-                    Ordering::Equal
-                }
-            })
-            .is_ok()
+        self.containing(x).is_some()
+    }
+
+    pub(crate) fn containing(&self, x: T) -> Option<Range<T>> {
+        let i = self.0.partition_point(|range| range.end <= x);
+        self.0.get(i).filter(|range| range.start <= x).cloned()
     }
 
     pub(crate) fn iter_range(&self, range: Range<T>) -> impl Iterator<Item = Range<T>> + '_ {
