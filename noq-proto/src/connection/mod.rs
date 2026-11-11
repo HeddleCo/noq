@@ -2792,6 +2792,17 @@ impl Connection {
         self.crypto_state.session.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn packet_keys_for_test(
+        &mut self,
+    ) -> &mut crypto::KeyPair<Box<dyn crypto::PacketKey>> {
+        &mut self.crypto_state.spaces[SpaceKind::Data]
+            .keys
+            .as_mut()
+            .unwrap()
+            .packet
+    }
+
     /// Whether the connection is in the process of being established
     ///
     /// If this returns `false`, the connection may be either established or closed, signaled by the
@@ -3294,24 +3305,24 @@ impl Connection {
         }
     }
 
+    /// Discard temporary keys three times the largest PTO of all paths (QUIC-MULTIPATH § 2.5)
+    /// after `now`, the receipt of a packet that needed them to be kept: the first packet using
+    /// the new 1-RTT keys or 1-RTT keys after 0-RTT, or a late new packet using the old 1-RTT keys.
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceKind) {
-        let start = if self.crypto_state.has_keys(EncryptionLevel::ZeroRtt) {
-            now
-        } else {
-            self.crypto_state
-                .prev_crypto
-                .as_ref()
-                .expect("no previous keys")
-                .end_packet
-                .as_ref()
-                .expect("update not acknowledged yet")
-                .2
-        };
-
-        // QUIC-MULTIPATH § 2.5 Key Phase Update Process: use largest PTO of all paths.
+        let deadline = now + self.max_pto_for_space(space) * 3;
+        if let Some(prev) = self.crypto_state.prev_crypto.as_mut()
+            && prev.end_packet.is_some()
+        {
+            // C-1509: genuine delayed packets can extend retention, but never this cap.
+            let cap = self
+                .idle_timeout
+                .unwrap_or(Duration::from_secs(30))
+                .min(Duration::from_secs(30));
+            let _ = prev.discard_deadline.get_or_insert(now + cap);
+        }
         self.timers.set(
             Timer::Conn(ConnTimer::KeyDiscard),
-            start + self.max_pto_for_space(space) * 3,
+            deadline,
             self.qlog.with_time(now),
         );
     }
@@ -4469,7 +4480,18 @@ impl Connection {
                     }
                     self.qlog.emit_packet_received(qlog, now);
                     return;
-                } else if self.state.is_handshake() && packet.header.is_short() {
+                }
+                // A new packet still using the old keys after the update was confirmed shows
+                // that reordering outlasts the PTO measured so far (a stalled or deeply queued
+                // route). Count the retention from it, so the rest of that flight decrypts.
+                if packet.header.is_short()
+                    && packet.header.key_phase() != self.crypto_state.key_phase
+                    && let Some(prev) = &self.crypto_state.prev_crypto
+                    && prev.end_packet.is_some()
+                {
+                    self.set_key_discard_timer(now, SpaceKind::Data);
+                }
+                if self.state.is_handshake() && packet.header.is_short() {
                     // TODO: SHOULD buffer these to improve reordering tolerance.
                     trace!("dropping short packet during handshake");
                     self.qlog.emit_packet_received(qlog, now);
@@ -6816,6 +6838,7 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
+        self.crypto_state.discard_temporary_keys();
         self.timers.reset();
         self.late_streams = spaces::LateStreams::default();
     }
@@ -6953,14 +6976,14 @@ impl Connection {
         if result.outgoing_key_update_acked
             && let Some(prev) = self.crypto_state.prev_crypto.as_mut()
         {
-            prev.end_packet = Some((path_id, result.packet_number, now));
+            prev.end_packet = Some((path_id, result.packet_number));
             self.set_key_discard_timer(now, packet.header.space());
         }
 
         if result.incoming_key_update {
             trace!("key update authenticated");
             self.crypto_state
-                .update_keys(Some((path_id, result.packet_number, now)), true);
+                .update_keys(Some((path_id, result.packet_number)), true);
             self.set_key_discard_timer(now, packet.header.space());
         }
 
