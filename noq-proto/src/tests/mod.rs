@@ -57,6 +57,7 @@ use util::{
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod encode_decode;
 mod multipath;
+mod net3;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod proptests;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

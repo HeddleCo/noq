@@ -2492,6 +2492,13 @@ pub(super) struct MixedRouteRouting {
     pub(super) direct_response_latency: Duration,
     /// Serialization delay per packet on the shaped route.
     pub(super) spacing: Duration,
+    /// NET-3: independently shape download and hold either FIFO until a simulated instant.
+    pub(super) shape_download: bool,
+    pub(super) download_departures: VecDeque<Instant>,
+    pub(super) hold_upload: Option<Instant>,
+    pub(super) hold_download: Option<Instant>,
+    /// Hold probe responses until all candidate probes have overtaken the data.
+    pub(super) probe_replies_until: Option<Instant>,
 }
 
 impl Default for MixedRouteRouting {
@@ -2502,6 +2509,11 @@ impl Default for MixedRouteRouting {
             latency: Duration::from_millis(100),
             direct_response_latency: Duration::from_millis(100),
             spacing: Duration::from_micros(100),
+            shape_download: false,
+            download_departures: VecDeque::new(),
+            hold_upload: None,
+            hold_download: None,
+            probe_replies_until: None,
         }
     }
 }
@@ -2511,23 +2523,35 @@ impl MixedRouteRouting {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 2, 2)), 1);
 
     fn route_client_to_server(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
-        let recv_time = if transmit.destination == Pair::SERVER_ADDR {
+        let src = transmit
+            .src_ip
+            .map(|ip| SocketAddr::new(ip, 1))
+            .unwrap_or(Pair::CLIENT_ADDR);
+        let reply = src != Pair::CLIENT_ADDR;
+        let recv_time = if transmit.destination == Pair::SERVER_ADDR && !reply {
             while self.departures.front().is_some_and(|time| *time <= now) {
                 self.departures.pop_front();
             }
             let departure = if self.shaped {
-                self.departures.back().copied().unwrap_or(now).max(now) + self.spacing
+                self.departures
+                    .back()
+                    .copied()
+                    .unwrap_or(now)
+                    .max(now)
+                    .max(self.hold_upload.unwrap_or(now))
+                    + self.spacing
             } else {
                 now
             };
             self.departures.push_back(departure);
             departure + self.latency
+        } else if reply {
+            self.probe_replies_until.unwrap_or(now).max(now)
         } else {
-            assert_eq!(transmit.destination, Self::DIRECT);
             now
         };
         RoutingDecision::Deliver {
-            src: Pair::CLIENT_ADDR,
+            src,
             dst: Some(transmit.destination.ip()),
             recv_time,
             congestion_experienced: false,
@@ -2535,18 +2559,46 @@ impl MixedRouteRouting {
     }
 
     fn route_server_to_client(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
+        let src = transmit
+            .src_ip
+            .map(|ip| SocketAddr::new(ip, 1))
+            .unwrap_or(Pair::SERVER_ADDR);
+        let direct = src != Pair::SERVER_ADDR || transmit.destination != Pair::CLIENT_ADDR;
+        let departure = if self.shape_download && !direct {
+            while self
+                .download_departures
+                .front()
+                .is_some_and(|time| *time <= now)
+            {
+                self.download_departures.pop_front();
+            }
+            let departure = self
+                .download_departures
+                .back()
+                .copied()
+                .unwrap_or(now)
+                .max(now)
+                .max(self.hold_download.unwrap_or(now))
+                + self.spacing;
+            self.download_departures.push_back(departure);
+            departure
+        } else {
+            now
+        };
         RoutingDecision::Deliver {
-            src: match transmit.src_ip {
-                Some(ip) if ip == Self::DIRECT.ip() => Self::DIRECT,
-                _ => Pair::SERVER_ADDR,
-            },
+            src,
             dst: Some(transmit.destination.ip()),
-            recv_time: now
-                + if transmit.src_ip == Some(Self::DIRECT.ip()) {
+            recv_time: (departure
+                + if direct {
                     self.direct_response_latency
                 } else {
                     self.latency
-                },
+                })
+            .max(if src != Pair::SERVER_ADDR {
+                self.probe_replies_until.unwrap_or(now)
+            } else {
+                now
+            }),
             congestion_experienced: false,
         }
     }
