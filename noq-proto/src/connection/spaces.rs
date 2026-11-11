@@ -1033,7 +1033,7 @@ impl Dedup {
 
     fn remember(&mut self, packet: u64) -> bool {
         let duplicate = !self.older.insert_one(packet);
-        if (self.older.range_count() > 32
+        if (self.older.range_count() > self.max_ranges.max(32)
             || self.older.min() == Some(self.floor))
             && let Some(oldest) = self.older.pop_min()
         {
