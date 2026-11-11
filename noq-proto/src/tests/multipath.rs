@@ -2436,12 +2436,27 @@ fn mixed_route_stream(short_prefix: bool) -> TestResult {
 /// which keys open the larger path-0 packet numbers queued behind it.
 #[test]
 fn key_update_first_seen_on_fast_path_keeps_queued_old_phase() -> TestResult {
+    key_update_with_queued_old_phase(super::util::MixedRouteRouting::default())
+}
+
+/// The slow flight outlives three fast-path PTOs, but must retain its old-phase keys.
+#[test]
+fn key_discard_waits_for_slow_path_old_phase_packets() -> TestResult {
+    key_update_with_queued_old_phase(super::util::MixedRouteRouting {
+        latency: Duration::from_secs(1),
+        direct_response_latency: Duration::ZERO,
+        ..Default::default()
+    })
+}
+
+fn key_update_with_queued_old_phase(routes: super::util::MixedRouteRouting) -> TestResult {
     use super::util::{MixedRouteRouting, Routing};
     const LEN: usize = 64 * 1024;
+    let warm_fast_path = routes.direct_response_latency.is_zero();
     let mut pair = ConnPair::builder()
         .enable_multipath()
         .disable_mtud_discovery()
-        .with_routes(MixedRouteRouting::default())
+        .with_routes(routes)
         .connect();
     let fast = pair.open_path(
         Client,
@@ -2452,6 +2467,29 @@ fn key_update_first_seen_on_fast_path_keeps_queued_old_phase() -> TestResult {
     assert!(
         pair.path_stats(Server, fast).is_some(),
         "direct path opened"
+    );
+    if warm_fast_path {
+        // ACKs may use another path. Put both endpoints on the direct route while
+        // measuring it, then restore only the client's slow upload route.
+        for side in [Client, Server] {
+            pair.set_path_status(side, fast, PathStatus::Available)?;
+            pair.set_path_status(side, PathId::ZERO, PathStatus::Backup)?;
+        }
+        pair.drive();
+        for _ in 0..64 {
+            pair.ping_path(Client, fast)?;
+            pair.ping_path(Server, fast)?;
+            pair.drive();
+        }
+        pair.set_path_status(Client, PathId::ZERO, PathStatus::Available)?;
+        pair.set_path_status(Client, fast, PathStatus::Backup)?;
+    }
+    // Record the test's timing premise; the oracle below is delivery without drops.
+    std::eprintln!(
+        "key_update_routes slow_rtt={:?} fast_rtt={:?} max_pto={:?}",
+        pair.rtt(Server, PathId::ZERO).unwrap(),
+        pair.rtt(Server, fast).unwrap(),
+        pair.conn(Server).base_pto(),
     );
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
     if let Routing::MixedRoute(route) = &mut pair.routes {
@@ -2465,6 +2503,13 @@ fn key_update_first_seen_on_fast_path_keeps_queued_old_phase() -> TestResult {
     pair.conn_mut(Client).ping_path(fast)?;
     // The new-phase PING takes the direct route and overtakes them.
     pair.drive_client();
+    pair.drive_server();
+    if let Some(deadline) = pair
+        .conn(Server)
+        .timer_pending(Timer::Conn(crate::connection::timer::ConnTimer::KeyDiscard))
+    {
+        std::eprintln!("key_discard_after={:?}", deadline - pair.time);
+    }
     let mut received = 0;
     let mut ended = false;
     for _ in 0..10000 {
@@ -2488,11 +2533,19 @@ fn key_update_first_seen_on_fast_path_keeps_queued_old_phase() -> TestResult {
         }
     }
     let server = pair.stats(Server);
+    let client = pair.stats(Client);
     let path = pair.path_stats(Client, PathId::ZERO).unwrap();
+    std::eprintln!(
+        "key_update_delivery authentication_drops={} client_authentication_drops={} lost_packets={} received={received} ended={ended}",
+        server.authentication_drops,
+        client.authentication_drops,
+        path.lost_packets,
+    );
     assert_eq!(
         server.authentication_drops, 0,
         "queued old-phase packets opened with the wrong keys"
     );
+    assert_eq!(client.authentication_drops, 0);
     assert_eq!(path.lost_packets, 0);
     assert_eq!(received, LEN);
     assert!(ended);

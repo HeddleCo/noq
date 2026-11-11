@@ -3311,7 +3311,7 @@ impl Connection {
         // QUIC-MULTIPATH § 2.5 Key Phase Update Process: use largest PTO of all paths.
         self.timers.set(
             Timer::Conn(ConnTimer::KeyDiscard),
-            start + self.max_pto_for_space(space) * 3,
+            start + self.pto(space, PathId::ZERO.saturating_add(1u8)) * 3,
             self.qlog.with_time(now),
         );
     }
