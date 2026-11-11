@@ -331,6 +331,18 @@ impl SendBuffer {
         self.data.range().start
     }
 
+    pub(super) fn is_acknowledged(&self, range: Range<u64>) -> bool {
+        let acked = self.acknowledged_range(range.end);
+        acked.start <= range.start && acked.end >= range.end
+    }
+
+    pub(super) fn acknowledged_range(&self, end: u64) -> Range<u64> {
+        if end <= self.fully_acked_offset() {
+            return 0..self.fully_acked_offset();
+        }
+        self.acks.containing(end - 1).unwrap_or(end..end)
+    }
+
     /// First stream offset unwritten by the application, i.e. the offset that the next write will
     /// begin at
     pub(super) fn offset(&self) -> u64 {

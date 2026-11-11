@@ -24,6 +24,66 @@ use crate::{
     shared::IssuedCid,
 };
 
+type LatePacket = (SpaceId, PathId, u64);
+
+/// Metadata only; packet and stream indexes share one expiry-ordered owner.
+#[derive(Default)]
+pub(super) struct LateStreams {
+    entries: BTreeMap<(Instant, LatePacket), frame::StreamMetaVec>,
+    pub(super) packets: BTreeMap<LatePacket, Instant>,
+    streams: BTreeSet<(StreamId, u64, LatePacket)>,
+}
+impl LateStreams {
+    pub(super) fn next_expiry(&self) -> Option<Instant> {
+        self.entries.first_key_value().map(|((at, _), _)| *at)
+    }
+    pub(super) fn insert(&mut self, key: LatePacket, at: Instant, frames: frame::StreamMetaVec) {
+        if frames.is_empty() {
+            return;
+        }
+        for frame in &frames {
+            self.streams.insert((frame.id, frame.offsets.end, key));
+        }
+        self.packets.insert(key, at);
+        self.entries.insert((at, key), frames);
+    }
+    pub(super) fn remove(&mut self, key: &LatePacket) -> Option<(Instant, frame::StreamMetaVec)> {
+        let at = self.packets.remove(key)?;
+        let frames = self.entries.remove(&(at, *key))?;
+        for frame in &frames {
+            self.streams.remove(&(frame.id, frame.offsets.end, *key));
+        }
+        Some((at, frames))
+    }
+    pub(super) fn expire(&mut self, now: Instant) {
+        while let Some((&(at, key), _)) = self.entries.first_key_value() {
+            if at > now {
+                break;
+            }
+            self.remove(&key);
+        }
+    }
+    pub(super) fn acknowledged(&mut self, frame: &frame::StreamMeta, streams: &StreamsState) {
+        let range = streams.acknowledged_range(frame);
+        let keys: BTreeSet<_> = self
+            .streams
+            .range((frame.id, range.start, (SpaceId::Initial, PathId::ZERO, 0))..)
+            .take_while(|(id, end, _)| *id == frame.id && *end <= range.end)
+            .map(|(_, _, key)| *key)
+            .collect();
+        for key in keys {
+            if let Some((at, mut frames)) = self.remove(&key) {
+                frames.retain(|f| f.id != frame.id || !streams.is_acknowledged(f));
+                self.insert(key, at, frames);
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.packets.len()
+    }
+}
+
 pub(super) struct PacketSpace {
     /// Data to send
     pub(super) pending: Retransmits,

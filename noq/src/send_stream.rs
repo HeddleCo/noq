@@ -284,6 +284,14 @@ impl SendStream {
             .acknowledged_bytes()
     }
 
+    /// Unbacked-off data PTO across the connection's current paths.
+    pub fn base_pto(&self) -> std::time::Duration {
+        self.conn
+            .lock_without_waking("SendStream::base_pto")
+            .inner
+            .base_pto()
+    }
+
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream

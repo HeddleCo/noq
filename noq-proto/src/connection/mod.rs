@@ -177,6 +177,8 @@ pub struct Connection {
     /// deterministically select the next PathId to send on.
     // TODO(flub): well does it really? But deterministic is nice for now.
     paths: BTreeMap<PathId, PathState>,
+    /// Stream metadata only, eligible for late ACKs until three base PTOs after loss.
+    late_streams: spaces::LateStreams,
     /// Counter to uniquely identify every [`PathData`] created in this connection.
     ///
     /// Each [`PathData`] gets a [`PathData::generation`] that is unique among all
@@ -385,6 +387,7 @@ impl Connection {
                 },
             )]),
             path_generation_counter: 0,
+            late_streams: spaces::LateStreams::default(),
             allow_mtud,
             state,
             side: connection_side,
@@ -473,6 +476,37 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn timer_pending(&self, timer: Timer) -> Option<Instant> {
         self.timers.get(timer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn late_stream_work(&self) -> (usize, usize) {
+        (
+            self.late_streams.len(),
+            self.streams
+                .late_ack_checks
+                .swap(0, core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repeat_last_ack_for_work_test(&mut self, now: Instant) {
+        let largest = self.spaces[SpaceId::Data]
+            .for_path(PathId::ZERO)
+            .largest_acked_packet_pn
+            .unwrap();
+        let mut ranges = ArrayRangeSet::new();
+        ranges.insert_one(largest);
+        self.on_ack_received(
+            now,
+            SpaceId::Data,
+            frame::Ack {
+                largest,
+                delay: 0,
+                ranges,
+                ecn: None,
+            },
+        )
+        .unwrap();
     }
 
     /// Returns application-facing events
@@ -2479,6 +2513,10 @@ impl Connection {
             trace!("timeout");
             match timer {
                 Timer::Conn(timer) => match timer {
+                    ConnTimer::LateStreams => {
+                        self.late_streams.expire(now);
+                        self.set_late_stream_timer(now);
+                    }
                     ConnTimer::Close => {
                         self.state.move_to_drained(None, &mut self.endpoint_events);
                     }
@@ -2828,6 +2866,11 @@ impl Connection {
         self.path(path_id).map(|d| d.rtt.get())
     }
 
+    /// Unbacked-off data PTO, using the largest current path RTT estimate and peer ACK delay.
+    pub fn base_pto(&self) -> Duration {
+        self.max_pto_for_space(SpaceKind::Data)
+    }
+
     /// Current state of this connection's congestion controller, for debugging purposes
     pub fn congestion_state(&self, path_id: PathId) -> Option<&dyn Controller> {
         self.path(path_id).map(|d| d.congestion.as_ref())
@@ -2999,6 +3042,21 @@ impl Connection {
         let mut newly_acked: ArrayRangeSet = ArrayRangeSet::new();
         for range in ack.iter() {
             self.spaces[space].for_path(path).check_ack(range.clone())?;
+            let late: Vec<_> = self
+                .late_streams
+                .packets
+                .range((space, path, range.start)..(space, path, range.end))
+                .map(|(key, _)| *key)
+                .collect();
+            for key in late {
+                if let Some((_, frames)) =
+                    self.late_streams.remove(&key).filter(|(at, _)| now < *at)
+                {
+                    for frame in frames {
+                        self.on_stream_frame_acked(frame);
+                    }
+                }
+            }
             for (pn, _) in self.spaces[space]
                 .for_path(path)
                 .sent_packets
@@ -3009,6 +3067,7 @@ impl Connection {
         }
 
         if newly_acked.is_empty() {
+            self.set_late_stream_timer(now);
             return Ok(());
         }
 
@@ -3120,8 +3179,22 @@ impl Connection {
             }
         }
 
+        self.set_late_stream_timer(now);
         self.set_loss_detection_timer(now, path);
         Ok(())
+    }
+
+    fn set_late_stream_timer(&mut self, now: Instant) {
+        self.timers.set_or_stop(
+            Timer::Conn(ConnTimer::LateStreams),
+            self.late_streams.next_expiry(),
+            self.qlog.with_time(now),
+        );
+    }
+
+    fn on_stream_frame_acked(&mut self, frame: frame::StreamMeta) {
+        self.streams.received_ack_of(frame.clone());
+        self.late_streams.acknowledged(&frame, &self.streams);
     }
 
     fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId, path: PathId) -> bool {
@@ -3221,7 +3294,7 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            self.on_stream_frame_acked(frame);
         }
     }
 
@@ -3482,6 +3555,7 @@ impl Connection {
         debug_assert!(lost_packets.is_sorted(), "lost_packets must be sorted");
 
         self.drain_lost_packets(now, pn_space, path_id);
+        self.set_late_stream_timer(now);
 
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
@@ -3503,7 +3577,7 @@ impl Connection {
             );
 
             for &packet in &lost_packets {
-                let Some(info) = self.spaces[pn_space].for_path(path_id).take(packet) else {
+                let Some(mut info) = self.spaces[pn_space].for_path(path_id).take(packet) else {
                     continue;
                 };
                 self.qlog
@@ -3513,8 +3587,18 @@ impl Connection {
                     .unwrap()
                     .remove_in_flight(&info);
 
-                for frame in info.stream_frames {
+                for frame in info.stream_frames.iter().cloned() {
                     self.streams.retransmit(frame);
+                }
+                info.stream_frames
+                    .retain(|frame| !self.streams.is_acknowledged(frame));
+                if !info.stream_frames.is_empty() {
+                    let expires = now + 3 * self.pto(pn_space.kind(), path_id);
+                    self.late_streams.insert(
+                        (pn_space, path_id, packet),
+                        expires,
+                        info.stream_frames,
+                    );
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);
@@ -4675,6 +4759,8 @@ impl Connection {
                         .remove_in_flight(&info);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
+                self.late_streams = spaces::LateStreams::default();
+                self.set_late_stream_timer(now);
                 self.streams.retransmit_all_for_0rtt();
 
                 let token_len = packet.payload.len() - 16;
@@ -4736,6 +4822,8 @@ impl Connection {
                             debug!("0-RTT rejected");
                             self.crypto_state.accepted_0rtt = false;
                             self.streams.zero_rtt_rejected();
+                            self.late_streams = spaces::LateStreams::default();
+                            self.set_late_stream_timer(now);
 
                             // Discard already-queued frames
                             self.spaces[SpaceId::Data].pending = Retransmits::default();
@@ -6725,6 +6813,7 @@ impl Connection {
     fn close_common(&mut self) {
         trace!("connection closed");
         self.timers.reset();
+        self.late_streams = spaces::LateStreams::default();
     }
 
     fn set_close_timer(&mut self, now: Instant) {

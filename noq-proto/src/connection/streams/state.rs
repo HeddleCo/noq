@@ -62,6 +62,8 @@ impl StreamRecv {
 
 #[allow(unreachable_pub)] // fuzzing only
 pub struct StreamsState {
+    #[cfg(test)]
+    pub(crate) late_ack_checks: core::sync::atomic::AtomicUsize,
     pub(super) side: Side,
     // Set of streams that are currently open, or could be immediately opened by the peer
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
@@ -149,6 +151,8 @@ impl StreamsState {
         stream_receive_window: VarInt,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            late_ack_checks: Default::default(),
             side,
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
@@ -605,8 +609,10 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
-        if !stream.ack(frame) {
+        let unacked = stream.pending.unacked();
+        let finished = stream.ack(frame);
+        self.unacked_data -= unacked - stream.pending.unacked();
+        if !finished {
             // The stream is unfinished or may still need retransmits
             return;
         }
@@ -626,6 +632,31 @@ impl StreamsState {
         }
         stream.fin_pending |= frame.fin;
         stream.pending.retransmit(frame.offsets);
+    }
+
+    pub(crate) fn acknowledged_range(&self, frame: &frame::StreamMeta) -> core::ops::Range<u64> {
+        self.send
+            .get(&frame.id)
+            .and_then(Option::as_ref)
+            .filter(|stream| !stream.is_reset())
+            .map_or(0..u64::MAX, |stream| {
+                stream.pending.acknowledged_range(frame.offsets.end)
+            })
+    }
+
+    pub(crate) fn is_acknowledged(&self, frame: &frame::StreamMeta) -> bool {
+        #[cfg(test)]
+        self.late_ack_checks
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.send
+            .get(&frame.id)
+            .and_then(Option::as_ref)
+            .is_none_or(|stream| {
+                stream.is_reset()
+                    || (stream.pending.is_acknowledged(frame.offsets.clone())
+                        && (!frame.fin
+                            || matches!(stream.state, SendState::DataSent { finish_acked: true })))
+            })
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {
