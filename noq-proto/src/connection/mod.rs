@@ -482,6 +482,37 @@ impl Connection {
         self.timers.get(timer)
     }
 
+    #[cfg(test)]
+    pub(crate) fn late_stream_work(&self) -> (usize, usize) {
+        (
+            self.late_streams.len(),
+            self.streams
+                .late_ack_checks
+                .swap(0, core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repeat_last_ack_for_work_test(&mut self, now: Instant) {
+        let largest = self.spaces[SpaceId::Data]
+            .for_path(PathId::ZERO)
+            .largest_acked_packet_pn
+            .unwrap();
+        let mut ranges = ArrayRangeSet::new();
+        ranges.insert_one(largest);
+        self.on_ack_received(
+            now,
+            SpaceId::Data,
+            frame::Ack {
+                largest,
+                delay: 0,
+                ranges,
+                ecn: None,
+            },
+        )
+        .unwrap();
+    }
+
     /// Returns application-facing events
     ///
     /// Connections should be polled for events after:
