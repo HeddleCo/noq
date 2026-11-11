@@ -3309,7 +3309,7 @@ impl Connection {
     /// after `now`, the receipt of a packet that needed them to be kept: the first packet using
     /// the new 1-RTT keys or 1-RTT keys after 0-RTT, or a late new packet using the old 1-RTT keys.
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceKind) {
-        let deadline = now + self.max_pto_for_space(space) * 3;
+        let mut deadline = now + self.max_pto_for_space(space) * 3;
         if let Some(prev) = self.crypto_state.prev_crypto.as_mut()
             && prev.end_packet.is_some()
         {
@@ -3318,7 +3318,7 @@ impl Connection {
                 .idle_timeout
                 .unwrap_or(Duration::from_secs(30))
                 .min(Duration::from_secs(30));
-            let _ = prev.discard_deadline.get_or_insert(now + cap);
+            deadline = deadline.min(*prev.discard_deadline.get_or_insert(now + cap));
         }
         self.timers.set(
             Timer::Conn(ConnTimer::KeyDiscard),
