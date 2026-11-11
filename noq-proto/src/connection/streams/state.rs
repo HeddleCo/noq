@@ -634,6 +634,16 @@ impl StreamsState {
         stream.pending.retransmit(frame.offsets);
     }
 
+    pub(crate) fn acknowledged_range(&self, frame: &frame::StreamMeta) -> core::ops::Range<u64> {
+        self.send
+            .get(&frame.id)
+            .and_then(Option::as_ref)
+            .filter(|stream| !stream.is_reset())
+            .map_or(0..u64::MAX, |stream| {
+                stream.pending.acknowledged_range(frame.offsets.end)
+            })
+    }
+
     pub(crate) fn is_acknowledged(&self, frame: &frame::StreamMeta) -> bool {
         #[cfg(test)]
         self.late_ack_checks

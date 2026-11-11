@@ -317,6 +317,7 @@ impl QlogSink {
         let timer_type: Option<TimerType> = match timer {
             Timer::Conn(conn_timer) => match conn_timer {
                 ConnTimer::Idle => Some(QlogTimerType::IdleTimeout.into()),
+                ConnTimer::LateStreams => Some(TimerType::custom("late_streams")),
                 ConnTimer::Close => Some(TimerType::custom("close")),
                 ConnTimer::KeyDiscard => Some(TimerType::custom("key_discard")),
                 ConnTimer::KeepAlive => Some(TimerType::custom("keep_alive")),

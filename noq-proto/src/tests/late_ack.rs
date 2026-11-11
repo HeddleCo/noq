@@ -124,7 +124,6 @@ fn late_packet_metadata_expires_after_three_base_ptos() {
 
 #[test]
 fn ack_work_is_independent_of_unrelated_retained_packets() {
-    let _guard = subscribe();
     for count in [8, 64] {
         let mut pair = Pair::default_with_deterministic_pns();
         let (client, _) = pair.connect_with(client_config_with_deterministic_pns());
