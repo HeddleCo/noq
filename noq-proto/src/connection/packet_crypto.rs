@@ -314,6 +314,7 @@ impl CryptoState {
     /// Discard temporary key state (0-RTT and previous keys).
     pub(super) fn discard_temporary_keys(&mut self) {
         self.zero_rtt_crypto = None;
+        self.prev_crypto = None;
     }
 
     /// Enable 0-RTT crypto with the given keys.
