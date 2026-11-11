@@ -2449,6 +2449,93 @@ fn key_discard_waits_for_slow_path_old_phase_packets() -> TestResult {
     })
 }
 
+/// A slow route drains old-phase packets for longer than three PTOs after the new key phase
+/// overtook them on the direct route. The server's PTO was measured before the queue built, so
+/// only the old-phase packets still arriving show that the reordering lasts longer.
+#[test]
+fn key_discard_waits_while_old_phase_packets_keep_arriving() -> TestResult {
+    use super::util::{MixedRouteRouting, Routing};
+    const LEN: usize = 32 * 1024;
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(MixedRouteRouting {
+            latency: Duration::from_millis(10),
+            direct_response_latency: Duration::from_millis(10),
+            spacing: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .connect();
+    let fast = pair.open_path(
+        Client,
+        FourTuple::from_remote(MixedRouteRouting::DIRECT),
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    if let Routing::MixedRoute(route) = &mut pair.routes {
+        route.shaped = true;
+    }
+    assert_eq!(pair.send_stream(Client, stream).write(&[42; LEN])?, LEN);
+    pair.send_stream(Client, stream).finish()?;
+    // Old-phase packets leave on path 0 and queue on the shaped route, 50 ms apart.
+    pair.drive_client();
+    pair.force_key_update(Client);
+    pair.conn_mut(Client).ping_path(fast)?;
+    // The new-phase PING takes the direct route and arms the server's key-discard timer.
+    pair.drive_client();
+    pair.drive_server();
+    let armed = pair
+        .conn(Server)
+        .timer_pending(Timer::Conn(crate::connection::timer::ConnTimer::KeyDiscard))
+        .expect("key discard armed");
+    let drained = match &pair.routes {
+        Routing::MixedRoute(route) => route.departures.back().copied(),
+        _ => None,
+    }
+    .expect("old-phase packets queued");
+    std::eprintln!(
+        "key_discard_queue armed_in={:?} drained_in={:?}",
+        armed - pair.time,
+        drained - pair.time,
+    );
+    assert!(
+        armed < drained,
+        "premise: the queue drains after the initial discard deadline"
+    );
+    let mut received = 0;
+    let mut ended = false;
+    for _ in 0..10000 {
+        if !pair.step() && ended {
+            break;
+        }
+        pair.streams(Server).accept(Dir::Uni);
+        if let Ok(mut chunks) = pair.recv_stream(Server, stream).read(false) {
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => received += chunk.bytes.len(),
+                    Ok(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(crate::ReadError::Blocked) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = chunks.finalize();
+        }
+    }
+    let drops = pair.stats(Server).authentication_drops;
+    std::eprintln!("key_discard_queue authentication_drops={drops} received={received}");
+    assert_eq!(
+        drops, 0,
+        "queued old-phase packets dropped after a key discard"
+    );
+    assert_eq!(received, LEN);
+    assert!(ended);
+    Ok(())
+}
+
 fn key_update_with_queued_old_phase(routes: super::util::MixedRouteRouting) -> TestResult {
     use super::util::{MixedRouteRouting, Routing};
     const LEN: usize = 64 * 1024;

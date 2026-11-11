@@ -2490,6 +2490,8 @@ pub(super) struct MixedRouteRouting {
     pub(super) departures: VecDeque<Instant>,
     pub(super) latency: Duration,
     pub(super) direct_response_latency: Duration,
+    /// Serialization delay per packet on the shaped route.
+    pub(super) spacing: Duration,
 }
 
 impl Default for MixedRouteRouting {
@@ -2499,6 +2501,7 @@ impl Default for MixedRouteRouting {
             departures: VecDeque::new(),
             latency: Duration::from_millis(100),
             direct_response_latency: Duration::from_millis(100),
+            spacing: Duration::from_micros(100),
         }
     }
 }
@@ -2513,7 +2516,7 @@ impl MixedRouteRouting {
                 self.departures.pop_front();
             }
             let departure = if self.shaped {
-                self.departures.back().copied().unwrap_or(now).max(now) + Duration::from_micros(100)
+                self.departures.back().copied().unwrap_or(now).max(now) + self.spacing
             } else {
                 now
             };
