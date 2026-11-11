@@ -240,7 +240,7 @@ impl CryptoState {
             // and we let this fall through to the final case.
             crypto
                 .end_packet
-                .is_none_or(|(_path, pn, _)| packet_number < pn)
+                .is_none_or(|(path, pn, _)| path != path_id || packet_number < pn)
         }) {
             &*prev.crypto.remote
         } else {
