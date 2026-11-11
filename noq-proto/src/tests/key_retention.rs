@@ -1,4 +1,4 @@
-//! C-1509 bounds, exercised with real encrypted packets and the simulated clock.
+//! C-1509/C-1512 bounds, exercised with real encrypted packets and the simulated clock.
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -26,6 +26,7 @@ struct ObservedKey {
     inner: Option<Box<dyn PacketKey>>,
     dropped: Arc<AtomicUsize>,
     integrity_limit: u64,
+    confidentiality_limit: Option<u64>,
 }
 
 impl Drop for ObservedKey {
@@ -59,14 +60,19 @@ impl PacketKey for ObservedKey {
         self.inner.as_ref().unwrap().tag_len()
     }
     fn confidentiality_limit(&self) -> u64 {
-        self.inner.as_ref().unwrap().confidentiality_limit()
+        self.confidentiality_limit
+            .unwrap_or_else(|| self.inner.as_ref().unwrap().confidentiality_limit())
     }
     fn integrity_limit(&self) -> u64 {
         self.integrity_limit
     }
 }
 
-fn observe(key: &mut Box<dyn PacketKey>, limit: u64) -> Arc<AtomicUsize> {
+fn observe(
+    key: &mut Box<dyn PacketKey>,
+    limit: u64,
+    confidentiality_limit: Option<u64>,
+) -> Arc<AtomicUsize> {
     let dropped = Arc::new(AtomicUsize::new(0));
     let inner = mem::replace(
         key,
@@ -74,12 +80,14 @@ fn observe(key: &mut Box<dyn PacketKey>, limit: u64) -> Arc<AtomicUsize> {
             inner: None,
             dropped: dropped.clone(),
             integrity_limit: limit,
+            confidentiality_limit,
         }),
     );
     *key = Box::new(ObservedKey {
         inner: Some(inner),
         dropped: dropped.clone(),
         integrity_limit: limit,
+        confidentiality_limit,
     });
     dropped
 }
@@ -124,7 +132,7 @@ impl Flight {
         )?;
         pair.drive();
         let key = &mut pair.conn_mut(Server).packet_keys_for_test().remote;
-        let dropped = observe(key, u64::MAX);
+        let dropped = observe(key, u64::MAX, None);
         let mut old = Vec::new();
         // These are distinct authenticated packets, held by the network rather than replayed.
         for i in 0..48 {
@@ -265,7 +273,7 @@ fn key_retention_further_phase_change_discards_previous() -> TestResult {
 fn key_retention_integrity_limit_counts_failed_previous_key_decryptions() -> TestResult {
     let mut flight = Flight::new(None)?;
     let key = &mut flight.pair.conn_mut(Server).packet_keys_for_test().local;
-    observe(key, 2);
+    observe(key, 2, None);
     let mut corrupt = flight.old.remove(0);
     // Damage the tag, outside the header-protection sample; the old-key selector is unchanged.
     let last = corrupt.packet.len() - 1;
@@ -351,5 +359,40 @@ fn key_retention_close_discards_previous_keys() -> TestResult {
         1,
         "closing cancelled the cap but retained its key"
     );
+    Ok(())
+}
+
+/// A pending slow path must not postpone the sender's scheduled phase change.
+#[test]
+fn key_retention_scheduled_update_releases_pending_paths() -> TestResult {
+    let mut flight = Flight::new(None)?;
+    // Send at least one packet in this phase, then put its confidentiality budget at one.
+    flight.pair.conn_mut(Server).ping_path(flight.fast)?;
+    flight.pair.drive_server();
+    let key = &mut flight.pair.conn_mut(Server).packet_keys_for_test().local;
+    observe(key, u64::MAX, Some(1));
+    let deadline = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
+    assert!(deadline > flight.pair.time);
+    assert_eq!(flight.dropped.load(Ordering::SeqCst), 0);
+
+    flight
+        .pair
+        .datagrams(Server)
+        .send(Bytes::from_static(b"scheduled update"), false)?;
+    flight.pair.drive_server();
+    assert_eq!(
+        flight.dropped.load(Ordering::SeqCst),
+        1,
+        "scheduled update was blocked by retained previous keys"
+    );
+    assert!(flight.pair.time < deadline, "update waited for key discard");
+    flight.pair.time += Duration::from_millis(500);
+    flight.pair.drive_client();
+    assert_eq!(
+        flight.pair.datagrams(Client).recv().unwrap(),
+        b"scheduled update"[..]
+    );
+    assert_eq!(flight.pair.stats(Client).authentication_drops, 0);
+    assert!(!flight.pair.conn(Server).is_closed());
     Ok(())
 }
