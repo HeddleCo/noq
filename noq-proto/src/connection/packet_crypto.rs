@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::BTreeMap};
+use alloc::boxed::Box;
 use core::{
     mem,
     ops::{Index, IndexMut},
@@ -45,16 +45,15 @@ pub(super) struct PrevCrypto {
     /// The keys used for the previous key phase, temporarily retained to decrypt packets sent by
     /// the peer prior to its own key update.
     pub(super) crypto: KeyPair<Box<dyn PacketKey>>,
-    /// Per path, the lowest packet number received using newer keys, which ends the interval for
-    /// which these keys are applicable on that path (packet numbers are per path, QUIC-MULTIPATH
-    /// § 2.5). A path that existed when the first newer packet arrived maps to `None` until it
-    /// delivers one; until then these keys stay (C-1509 cap), since anything queued on that path
-    /// still needs them.
+    /// The incoming packet that ends the interval for which these keys are applicable: its path
+    /// and its packet number.
     ///
-    /// Incoming packets should be decrypted using these keys iff this is `None`, their path has
-    /// no end yet, or their packet number is lower. `None` indicates that we have not yet
-    /// received a packet using newer keys, which implies that the update was locally initiated.
-    pub(super) end_packets: Option<BTreeMap<PathId, Option<u64>>>,
+    /// Incoming packets should be decrypted using these keys iff this is `None`, they arrived on
+    /// another path, or their packet number is lower. Packet numbers are per path, so on another
+    /// path only the key phase bit distinguishes the keys (QUIC-MULTIPATH § 2.5). `None`
+    /// indicates that we have not yet received a packet using newer keys, which implies that the
+    /// update was locally initiated.
+    pub(super) end_packet: Option<(PathId, u64)>,
     /// Absolute C-1509 retention cap, fixed by the first new-phase packet.
     pub(super) discard_deadline: Option<Instant>,
     /// Whether the following key phase is from a remotely initiated update that we haven't acked
@@ -241,12 +240,9 @@ impl CryptoState {
             // If this packet comes prior to acknowledgment of the key update by the peer,
             // use the previous keys. Otherwise this must be a remotely-initiated key update
             // and we let this fall through to the final case.
-            crypto.end_packets.as_ref().is_none_or(|ends| {
-                ends.get(&path_id)
-                    .copied()
-                    .flatten()
-                    .is_none_or(|end| packet_number < end)
-            })
+            crypto
+                .end_packet
+                .is_none_or(|(path, pn)| path != path_id || packet_number < pn)
         }) {
             &*prev.crypto.remote
         } else {
@@ -278,7 +274,7 @@ impl CryptoState {
 
         let mut outgoing_key_update_acked = false;
         if let Some(ref prev) = self.prev_crypto
-            && prev.end_packets.is_none()
+            && prev.end_packet.is_none()
             && packet_key_phase == conn_key_phase
         {
             outgoing_key_update_acked = true;
@@ -407,11 +403,7 @@ impl CryptoState {
     /// keys. Updates `key_phase` and `key_phase_size` accordingly.
     ///
     /// PANICS: If 1-RTT keys are missing.
-    pub(super) fn update_keys(
-        &mut self,
-        end_packets: Option<BTreeMap<PathId, Option<u64>>>,
-        remote: bool,
-    ) {
+    pub(super) fn update_keys(&mut self, end_packet: Option<(PathId, u64)>, remote: bool) {
         trace!("executing key update");
         if self.prev_crypto.is_some() {
             self.discard_temporary_keys();
@@ -432,7 +424,7 @@ impl CryptoState {
         );
         self.prev_crypto = Some(PrevCrypto {
             crypto: old,
-            end_packets,
+            end_packet,
             discard_deadline: None,
             update_unacked: remote,
         });

@@ -1,5 +1,5 @@
 //! NET-3: lossless per-direction FIFOs, real encrypted traffic, simulated time only.
-//! Run ignored cells with `cargo test -p noq-proto net3 -- --ignored --nocapture`.
+//! Run all 40 cells and 500 seeds with `cargo test -p noq-proto net3 -- --nocapture`.
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::time::Duration;
@@ -460,29 +460,20 @@ cells! {
     mechanism2_upload { spacing_us: 50_000 }
     m3_3_mechanism1_download { direction: Server, initiator: Server }
     m3_3_mechanism2_download { direction: Server, initiator: Server, spacing_us: 50_000 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=17 duplicate_discards=0"]
     m3_1_silent_upload { hold_ms: 1500 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=18 duplicate_discards=0"]
     m3_1_silent_download { direction: Server, initiator: Server, hold_ms: 1500 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=35 duplicate_discards=0"]
     m3_1_silent_both { both: true, both_update: true, hold_ms: 1500 }
     m3_2_probes_1 { probes: 1, timing: Timing::Before, hold_ms: 1500 }
     m3_2_probes_16 { probes: 16, timing: Timing::Before, hold_ms: 1500 }
-    #[ignore = "NET-3 red: M3-2 authentication_drops=0 duplicate_discards=61"]
     m3_2_probes_33 { probes: 33, timing: Timing::Before, hold_ms: 1500 }
-    #[ignore = "NET-3 red: M3-2 authentication_drops=0 duplicate_discards=124"]
     m3_2_probes_40 { probes: 40, timing: Timing::Before, hold_ms: 1500 }
-    #[ignore = "NET-3 red: M3-2 authentication_drops=0 duplicate_discards=270"]
     m3_2_download_probes_33 { direction: Server, initiator: Server, probes: 33, timing: Timing::Before, hold_ms: 1500 }
     m3_4_abandon_upload { path: PathEvent::Abandon, hold_ms: 1500 }
     m3_4_abandon_download { direction: Server, initiator: Server, path: PathEvent::Abandon, hold_ms: 1500 }
     hold_half_3pto_upload { hold_3pto_milli: 500 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=17 duplicate_discards=0"]
     hold_one_3pto_upload { hold_3pto_milli: 1000 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=17 duplicate_discards=0"]
     hold_three_3pto_upload { hold_3pto_milli: 3000 }
     hold_half_3pto_download { direction: Server, initiator: Server, hold_3pto_milli: 500 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=18 duplicate_discards=0"]
     hold_three_3pto_download { direction: Server, initiator: Server, hold_3pto_milli: 3000 }
     trickle_5ms { spacing_us: 5000 }
     trickle_20ms { spacing_us: 20_000 }
@@ -500,7 +491,6 @@ cells! {
     second_update_download { second: true, direction: Server, initiator: Server, spacing_us: 50_000 }
     demote_upload { path: PathEvent::Demote, spacing_us: 50_000 }
     demote_download { path: PathEvent::Demote, direction: Server, initiator: Server, spacing_us: 50_000 }
-    #[ignore = "NET-3 red: M3-1 authentication_drops=17 duplicate_discards=0"]
     demote_silent { path: PathEvent::Demote, hold_ms: 1500 }
     validate_during_upload { path: PathEvent::ValidateDuring, spacing_us: 5000 }
     validate_during_download { path: PathEvent::ValidateDuring, direction: Server, initiator: Server, spacing_us: 5000 }
@@ -508,35 +498,10 @@ cells! {
     both_trickle { both: true, both_update: true, spacing_us: 50_000 }
 }
 
-// Freeze the observed red corpus separately, preserving the zero-drop oracle.
-// The normal suite still executes all 409 green seeds; --ignored executes these 91.
-const RED_SEEDS: &[u64] = &[
-    2, 5, 6, 8, 11, 12, 20, 26, 28, 31, 33, 40, 44, 45, 47, 48, 53, 67, 74, 78, 88, 103, 106, 109,
-    111, 118, 127, 133, 134, 137, 141, 146, 153, 165, 170, 172, 179, 185, 201, 213, 214, 217, 238,
-    240, 258, 264, 266, 271, 277, 281, 283, 290, 291, 296, 308, 313, 320, 324, 329, 333, 334, 336,
-    343, 349, 357, 358, 360, 372, 373, 381, 393, 394, 396, 400, 402, 405, 419, 422, 428, 431, 434,
-    448, 457, 460, 464, 468, 469, 472, 481, 482, 488,
-];
-
 #[test]
 fn seeded_sweep() -> TestResult {
-    sweep(false)
-}
-
-#[test]
-#[ignore = "NET-3 red: M3-1 silent-gap authentication drops in 91 seeds"]
-fn seeded_sweep_red() -> TestResult {
-    sweep(true)
-}
-
-fn sweep(red: bool) -> TestResult {
     let mut failures = Vec::new();
-    let mut executed = 0;
     for seed in 0..500 {
-        if RED_SEEDS.contains(&seed) != red {
-            continue;
-        }
-        executed += 1;
         let mut rng = StdRng::seed_from_u64(seed);
         let direction = if rng.random() { Client } else { Server };
         let timing = [
@@ -568,7 +533,7 @@ fn sweep(red: bool) -> TestResult {
         }
     }
     std::eprintln!(
-        "NET3 sweep domain=0..500 quarantined={red} executed={executed} red={} signatures={failures:?}",
+        "NET3 sweep domain=0..500 red={} signatures={failures:?}",
         failures.len()
     );
     assert!(
