@@ -312,6 +312,9 @@ pub struct Connection {
 
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
+    /// `Dedup` ranges per path: every off-path probe the peer may send in one traversal round
+    /// can land as its own out-of-order island ahead of queued packets (C-1492).
+    dedup_max_ranges: usize,
     qlog: QlogSink,
 }
 
@@ -442,6 +445,7 @@ impl Connection {
             abandoned_paths: Default::default(),
 
             n0_nat_traversal: Default::default(),
+            dedup_max_ranges: 0,
             qlog,
         };
         if path_validated {
@@ -4472,7 +4476,11 @@ impl Connection {
                 let dedup = self.spaces[packet.header.space()]
                     .path_space_mut(path_id)
                     .map(|pns| &mut pns.dedup);
-                if pn.zip(dedup).is_some_and(|(n, d)| d.insert(n)) {
+                let max_ranges = self.dedup_max_ranges;
+                if pn.zip(dedup).is_some_and(|(n, d)| {
+                    d.max_ranges = max_ranges;
+                    d.insert(n)
+                }) {
                     debug!("discarding possible duplicate packet");
                     #[cfg(test)]
                     {
@@ -6930,6 +6938,8 @@ impl Connection {
             if multipath_enabled {
                 let max_local_addresses = max_remotely_allowed_remote_addresses.get();
                 let max_remote_addresses = max_locally_allowed_remote_addresses.get();
+                self.dedup_max_ranges = usize::from(max_local_addresses)
+                    * usize::from(n0_nat_traversal::MAX_NAT_PROBE_ATTEMPTS);
                 self.n0_nat_traversal = n0_nat_traversal::State::new(
                     max_remote_addresses,
                     max_local_addresses,
