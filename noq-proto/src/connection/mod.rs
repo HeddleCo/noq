@@ -2782,9 +2782,14 @@ impl Connection {
             debug!("ignoring forced key update in illegal state");
             return;
         }
-        if self.crypto_state.prev_crypto.is_some() {
-            // We already just updated, or are currently updating, the keys. Concurrent key updates
-            // are illegal.
+        if self.crypto_state.prev_crypto.is_some()
+            && self
+                .crypto_state
+                .remaining_packet_budget(EncryptionLevel::OneRtt)
+                != Some(0)
+        {
+            // Retained keys defer voluntary updates, but must not delay the scheduled update
+            // at phase exhaustion (C-1512 (e)). update_keys releases them through the shared path.
             debug!("ignoring redundant forced key update");
             return;
         }
