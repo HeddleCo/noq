@@ -2531,7 +2531,10 @@ impl MixedRouteRouting {
 
     fn route_server_to_client(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
         RoutingDecision::Deliver {
-            src: Pair::SERVER_ADDR,
+            src: match transmit.src_ip {
+                Some(ip) if ip == Self::DIRECT.ip() => Self::DIRECT,
+                _ => Pair::SERVER_ADDR,
+            },
             dst: Some(transmit.destination.ip()),
             recv_time: now + self.latency,
             congestion_experienced: false,

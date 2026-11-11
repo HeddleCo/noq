@@ -2428,3 +2428,73 @@ fn mixed_route_stream(short_prefix: bool) -> TestResult {
     assert!(acked, "the complete stream and FIN must be acknowledged");
     Ok(())
 }
+
+/// Packet numbers are per path, so the receiver's key-update boundary must be too.
+///
+/// Old-phase stream packets sit in path 0's slow FIFO while a PING on a second, direct path
+/// carries the new key phase and arrives first. Its small path-1 packet number must not decide
+/// which keys open the larger path-0 packet numbers queued behind it.
+#[test]
+fn key_update_first_seen_on_fast_path_keeps_queued_old_phase() -> TestResult {
+    use super::util::{MixedRouteRouting, Routing};
+    const LEN: usize = 64 * 1024;
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(MixedRouteRouting::default())
+        .connect();
+    let fast = pair.open_path(
+        Client,
+        FourTuple::from_remote(MixedRouteRouting::DIRECT),
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+    assert!(
+        pair.path_stats(Server, fast).is_some(),
+        "direct path opened"
+    );
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    if let Routing::MixedRoute(route) = &mut pair.routes {
+        route.shaped = true;
+    }
+    assert_eq!(pair.send_stream(Client, stream).write(&[42; LEN])?, LEN);
+    pair.send_stream(Client, stream).finish()?;
+    // Old-phase packets leave on path 0 and queue in the FIFO.
+    pair.drive_client();
+    pair.force_key_update(Client);
+    pair.conn_mut(Client).ping_path(fast)?;
+    // The new-phase PING takes the direct route and overtakes them.
+    pair.drive_client();
+    let mut received = 0;
+    let mut ended = false;
+    for _ in 0..10000 {
+        if !pair.step() && ended {
+            break;
+        }
+        pair.streams(Server).accept(Dir::Uni);
+        if let Ok(mut chunks) = pair.recv_stream(Server, stream).read(false) {
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => received += chunk.bytes.len(),
+                    Ok(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(crate::ReadError::Blocked) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = chunks.finalize();
+        }
+    }
+    let server = pair.stats(Server);
+    let path = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(
+        server.authentication_drops, 0,
+        "queued old-phase packets opened with the wrong keys"
+    );
+    assert_eq!(path.lost_packets, 0);
+    assert_eq!(received, LEN);
+    assert!(ended);
+    Ok(())
+}

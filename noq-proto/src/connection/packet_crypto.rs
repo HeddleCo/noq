@@ -45,13 +45,15 @@ pub(super) struct PrevCrypto {
     /// The keys used for the previous key phase, temporarily retained to decrypt packets sent by
     /// the peer prior to its own key update.
     pub(super) crypto: KeyPair<Box<dyn PacketKey>>,
-    /// The incoming packet that ends the interval for which these keys are applicable, and the
-    /// time of its receipt.
+    /// The incoming packet that ends the interval for which these keys are applicable: its path,
+    /// its packet number, and the time of its receipt.
     ///
-    /// Incoming packets should be decrypted using these keys iff this is `None` or their packet
-    /// number is lower. `None` indicates that we have not yet received a packet using newer keys,
-    /// which implies that the update was locally initiated.
-    pub(super) end_packet: Option<(u64, Instant)>,
+    /// Incoming packets should be decrypted using these keys iff this is `None`, they arrived on
+    /// another path, or their packet number is lower. Packet numbers are per path, so on another
+    /// path only the key phase bit distinguishes the keys (QUIC-MULTIPATH § 2.5). `None`
+    /// indicates that we have not yet received a packet using newer keys, which implies that the
+    /// update was locally initiated.
+    pub(super) end_packet: Option<(PathId, u64, Instant)>,
     /// Whether the following key phase is from a remotely initiated update that we haven't acked
     pub(super) update_unacked: bool,
 }
@@ -236,7 +238,9 @@ impl CryptoState {
             // If this packet comes prior to acknowledgment of the key update by the peer,
             // use the previous keys. Otherwise this must be a remotely-initiated key update
             // and we let this fall through to the final case.
-            crypto.end_packet.is_none_or(|(pn, _)| packet_number < pn)
+            crypto
+                .end_packet
+                .is_none_or(|(_path, pn, _)| packet_number < pn)
         }) {
             &*prev.crypto.remote
         } else {
@@ -397,7 +401,7 @@ impl CryptoState {
     /// keys. Updates `key_phase` and `key_phase_size` accordingly.
     ///
     /// PANICS: If 1-RTT keys are missing.
-    pub(super) fn update_keys(&mut self, end_packet: Option<(u64, Instant)>, remote: bool) {
+    pub(super) fn update_keys(&mut self, end_packet: Option<(PathId, u64, Instant)>, remote: bool) {
         trace!("executing key update");
 
         let new = self

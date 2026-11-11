@@ -3305,7 +3305,7 @@ impl Connection {
                 .end_packet
                 .as_ref()
                 .expect("update not acknowledged yet")
-                .1
+                .2
         };
 
         // QUIC-MULTIPATH § 2.5 Key Phase Update Process: use largest PTO of all paths.
@@ -6953,14 +6953,14 @@ impl Connection {
         if result.outgoing_key_update_acked
             && let Some(prev) = self.crypto_state.prev_crypto.as_mut()
         {
-            prev.end_packet = Some((result.packet_number, now));
+            prev.end_packet = Some((path_id, result.packet_number, now));
             self.set_key_discard_timer(now, packet.header.space());
         }
 
         if result.incoming_key_update {
             trace!("key update authenticated");
             self.crypto_state
-                .update_keys(Some((result.packet_number, now)), true);
+                .update_keys(Some((path_id, result.packet_number, now)), true);
             self.set_key_discard_timer(now, packet.header.space());
         }
 
