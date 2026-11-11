@@ -2485,10 +2485,11 @@ fn key_discard_waits_while_old_phase_packets_keep_arriving() -> TestResult {
     // The new-phase PING takes the direct route and arms the server's key-discard timer.
     pair.drive_client();
     pair.drive_server();
-    let armed = pair
-        .conn(Server)
+    pair.conn(Server)
         .timer_pending(Timer::Conn(crate::connection::timer::ConnTimer::KeyDiscard))
         .expect("key discard armed");
+    // The RFC 9001 § 6.5 deadline: 3 × PTO after the first new-phase packet.
+    let armed = pair.time + pair.conn(Server).base_pto() * 3;
     let drained = match &pair.routes {
         Routing::MixedRoute(route) => route.departures.back().copied(),
         _ => None,
