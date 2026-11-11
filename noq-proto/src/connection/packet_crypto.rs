@@ -405,9 +405,6 @@ impl CryptoState {
     /// PANICS: If 1-RTT keys are missing.
     pub(super) fn update_keys(&mut self, end_packet: Option<(PathId, u64)>, remote: bool) {
         trace!("executing key update");
-        if self.prev_crypto.is_some() {
-            self.discard_temporary_keys();
-        }
 
         let new = self
             .session
@@ -422,7 +419,7 @@ impl CryptoState {
                 .packet,
             mem::replace(self.next_crypto.as_mut().unwrap(), new),
         );
-        self.prev_crypto = Some(PrevCrypto {
+        self.prev_crypto.get_or_insert(PrevCrypto {
             crypto: old,
             end_packet,
             discard_deadline: None,
