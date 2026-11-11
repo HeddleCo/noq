@@ -4410,6 +4410,7 @@ impl Connection {
             }
             Err(None) => {
                 debug!("failed to authenticate packet");
+                self.authentication_failures += 1;
                 #[cfg(test)]
                 {
                     self.partial_stats.authentication_drops += 1;
