@@ -366,9 +366,13 @@ fn key_retention_close_discards_previous_keys() -> TestResult {
 #[test]
 fn key_retention_scheduled_update_releases_pending_paths() -> TestResult {
     let mut flight = Flight::new(None)?;
-    // Send at least one packet in this phase, then put its confidentiality budget at one.
+    // Confirm this phase on both client paths while the server's slow path remains pending.
+    flight.pair.conn_mut(Server).ping_path(PathId::ZERO)?;
     flight.pair.conn_mut(Server).ping_path(flight.fast)?;
     flight.pair.drive_server();
+    flight.pair.time += Duration::from_millis(500);
+    flight.pair.drive_client();
+    // This phase has sent packets already; a one-packet budget makes the next update due.
     let key = &mut flight.pair.conn_mut(Server).packet_keys_for_test().local;
     observe(key, u64::MAX, Some(1));
     let deadline = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
