@@ -98,6 +98,7 @@ impl Flight {
         let mut cfg = TransportConfig::default();
         cfg.max_idle_timeout(idle.map(|d| d.try_into().unwrap()));
         cfg.initial_rtt(Duration::from_secs(1));
+        cfg.mtu_discovery_config(None);
         cfg.congestion_controller_factory(Arc::new(cc));
         cfg.initial_key_phase_size(Some(u64::MAX));
         // Only the client proposes an idle timeout. The server must use the negotiated
