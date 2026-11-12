@@ -1,5 +1,5 @@
 //! NET-3: lossless per-direction FIFOs, real encrypted traffic, simulated time only.
-//! Run all 40 cells and 500 seeds with `cargo test -p noq-proto net3 -- --nocapture`.
+//! Run all 45 cells and 500 seeds with `cargo test -p noq-proto net3 -- --nocapture`.
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::time::Duration;
@@ -43,6 +43,10 @@ struct Cell {
     spacing_us: u64,
     bytes: usize,
     probes: usize,
+    /// M4: off-path probe replies are not held, so the server's replies overtake its download.
+    replies_overtake: bool,
+    /// M4: no direct ping after the update, so an off-path probe carries the first new phase.
+    probe_confirms: bool,
     second: bool,
 }
 impl Default for Cell {
@@ -59,6 +63,8 @@ impl Default for Cell {
             spacing_us: 100,
             bytes: 32 * 1024,
             probes: 0,
+            replies_overtake: false,
+            probe_confirms: false,
             second: false,
         }
     }
@@ -96,11 +102,13 @@ fn route(pair: &mut ConnPair) -> &mut MixedRouteRouting {
     };
     route
 }
-fn update(pair: &mut ConnPair, c: Cell, fast: PathId) -> TestResult {
+fn update(pair: &mut ConnPair, c: Cell, fast: Option<PathId>) -> TestResult {
     for side in [Client, Server] {
         if side == c.initiator || c.both_update {
             pair.force_key_update(side);
-            pair.ping_path(side, fast)?;
+            if let Some(fast) = fast.filter(|_| !c.probe_confirms) {
+                pair.ping_path(side, fast)?;
+            }
             drive_side(pair, side);
         }
     }
@@ -162,7 +170,11 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
         pair.drive();
     }
     if matches!(c.timing, Timing::Before) {
-        update(&mut pair, c, fast.expect("before cells validate first"))?;
+        update(
+            &mut pair,
+            c,
+            Some(fast.expect("before cells validate first")),
+        )?;
         pair.drive();
     }
     let start = pair.time;
@@ -175,7 +187,7 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
         r.shape_download = c.direction == Server || c.both;
         r.hold_upload = Some(release);
         r.hold_download = Some(release);
-        if c.probes > 0 {
+        if c.probes > 0 && !c.replies_overtake {
             r.probe_replies_until = Some(release);
         }
     }
@@ -223,7 +235,11 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
         pair.drive_server();
     }
     if matches!(c.timing, Timing::During) {
-        update(&mut pair, c, fast.expect("during cells have a direct path"))?;
+        let fast = match c.probe_confirms {
+            true => fast,
+            false => Some(fast.expect("during cells have a direct path")),
+        };
+        update(&mut pair, c, fast)?;
     }
     // Interleave real off-path probes with held path-0 PINGs. Each round creates a
     // distinct authenticated island separated by missing PNs; >128 PNs also leave
@@ -271,6 +287,9 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
         );
     }
     let mut boundary = None;
+    // C-1509 (a) runs from each side's first new-phase packet, which an overtaking probe
+    // can deliver after `start`: anchor the cap oracle where the side's discard timer arms.
+    let mut armed = [None; 2];
     let queued_until = route(&mut pair)
         .departures
         .back()
@@ -300,7 +319,7 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
             validation_done = true;
         }
         if !release_updated && pair.time >= release {
-            update(&mut pair, c, fast.expect("release path"))?;
+            update(&mut pair, c, Some(fast.expect("release path")))?;
             release_updated = true;
         }
         if !changed
@@ -320,6 +339,12 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
         }
         let before = pair.time;
         let active = pair.step();
+        for (side, armed) in [Client, Server].into_iter().zip(&mut armed) {
+            let discard = Timer::Conn(ConnTimer::KeyDiscard);
+            if armed.is_none() && pair.conn(side).timer_pending(discard).is_some() {
+                *armed = Some(pair.time);
+            }
+        }
         if boundary.is_none()
             && pair
                 .conn(!c.initiator)
@@ -370,17 +395,17 @@ fn run(c: Cell, seed: u64, label: &str) -> TestResult<Outcome> {
     // Pair::step treats key-discard-only connections as idle. Explicitly advance
     // these timer events before testing the second update and the retention cap.
     let discard = Timer::Conn(ConnTimer::KeyDiscard);
-    for side in [Client, Server] {
+    for (side, armed) in [Client, Server].into_iter().zip(armed) {
         if pair.conn(side).timer_pending(discard).is_some() {
             pair.drive_until_timer(side, discard);
             assert!(
-                pair.time <= start + Duration::from_secs(30),
+                pair.time <= armed.unwrap_or(start) + Duration::from_secs(30),
                 "seed={seed}: key retention cap"
             );
         }
     }
     if matches!(c.timing, Timing::After) || c.second {
-        update(&mut pair, c, fast.expect("after/second path"))?;
+        update(&mut pair, c, Some(fast.expect("after/second path")))?;
         pair.drive();
         for side in [Client, Server] {
             if pair.conn(side).timer_pending(discard).is_some() {
@@ -468,6 +493,11 @@ cells! {
     m3_2_probes_33 { probes: 33, timing: Timing::Before, hold_ms: 1500 }
     m3_2_probes_40 { probes: 40, timing: Timing::Before, hold_ms: 1500 }
     m3_2_download_probes_33 { direction: Server, initiator: Server, probes: 33, timing: Timing::Before, hold_ms: 1500 }
+    m4_probe_overtakes_update_upload { probes: 1, hold_ms: 1500 }
+    m4_probe_overtakes_update_download { direction: Server, initiator: Server, replies_overtake: true, probes: 1, hold_ms: 1500 }
+    m4_probe_confirms_update_upload { probes: 1, hold_ms: 1500, probe_confirms: true, path: PathEvent::ValidateRelease }
+    m4_probe_overtakes_update_both { both: true, both_update: true, probes: 1, hold_ms: 1500 }
+    m4_probe_overtakes_update_8 { probes: 8, hold_ms: 1500 }
     m3_4_abandon_upload { path: PathEvent::Abandon, hold_ms: 1500 }
     m3_4_abandon_download { direction: Server, initiator: Server, path: PathEvent::Abandon, hold_ms: 1500 }
     hold_half_3pto_upload { hold_3pto_milli: 500 }
@@ -525,6 +555,10 @@ fn seeded_sweep() -> TestResult {
             } else {
                 PathEvent::Demote
             },
+            // M4 axis (probe overtaking x key update), drawn last so seeds keep their
+            // earlier fields.
+            probes: usize::from(matches!(timing, Timing::During) && rng.random_ratio(1, 2)),
+            replies_overtake: direction == Server,
             ..Cell::default()
         };
         let result = run(c, seed, "seeded_sweep")?;
