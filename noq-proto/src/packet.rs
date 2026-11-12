@@ -747,9 +747,10 @@ pub(crate) enum PacketNumber {
 }
 
 impl PacketNumber {
-    pub(crate) fn new(n: u64, largest_acked: u64) -> Self {
+    pub(crate) fn new(n: u64, largest_acked: u64, min_two_bytes: bool) -> Self {
         let range = (n - largest_acked) * 2;
-        if range < 1 << 8 {
+        // QNT probes can overtake queued packets on another route (RFC 9000 §17.1).
+        if range < 1 << 8 && !min_two_bytes {
             Self::U8(n as u8)
         } else if range < 1 << 16 {
             Self::U16(n as u16)
@@ -1010,16 +1011,20 @@ mod tests {
 
     #[test]
     fn pn_encode() {
-        check_pn(PacketNumber::new(0x10, 0), &hex!("10"));
-        check_pn(PacketNumber::new(0x100, 0), &hex!("0100"));
-        check_pn(PacketNumber::new(0x10000, 0), &hex!("010000"));
+        check_pn(PacketNumber::new(0x10, 0, false), &hex!("10"));
+        check_pn(PacketNumber::new(0x10, 0, true), &hex!("0010"));
+        check_pn(PacketNumber::new(0x100, 0, false), &hex!("0100"));
+        check_pn(PacketNumber::new(0x10000, 0, false), &hex!("010000"));
     }
 
     #[test]
     fn pn_expand_roundtrip() {
         for expected in 0..1024 {
             for actual in expected..1024 {
-                assert_eq!(actual, PacketNumber::new(actual, expected).expand(expected));
+                assert_eq!(
+                    actual,
+                    PacketNumber::new(actual, expected, false).expand(expected)
+                );
             }
         }
     }

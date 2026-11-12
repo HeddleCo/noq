@@ -44,6 +44,7 @@ use crate::{
     transport_parameters::TransportParameters,
 };
 
+mod key_retention;
 mod late_ack;
 mod util;
 pub(crate) use util::subscribe;
@@ -56,6 +57,7 @@ use util::{
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod encode_decode;
 mod multipath;
+mod net3;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod proptests;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

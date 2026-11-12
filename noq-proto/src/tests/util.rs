@@ -1719,6 +1719,7 @@ pub(super) enum Routing {
     SimpleFirewall(SimpleFirewallRouting),
     ManyToMany(ManyToManyRouting),
     BwLimited(BwLimitedRouting),
+    MixedRoute(MixedRouteRouting),
 }
 
 impl Routing {
@@ -1731,6 +1732,7 @@ impl Routing {
             Self::SimpleFirewall(inner) => inner.public_server_addr(),
             Self::ManyToMany(inner) => inner.public_server_addr(),
             Self::BwLimited(inner) => inner.public_server_addr(),
+            Self::MixedRoute(_) => Pair::SERVER_ADDR,
         }
     }
 
@@ -1741,6 +1743,7 @@ impl Routing {
             Self::SimpleFirewall(inner) => inner.route_client_to_server(transmit, now),
             Self::ManyToMany(inner) => inner.route_client_to_server(transmit, now),
             Self::BwLimited(inner) => inner.route_client_to_server(transmit, now),
+            Self::MixedRoute(inner) => inner.route_client_to_server(transmit, now),
         }
     }
     /// Routes a datagram from server to client.
@@ -1750,6 +1753,7 @@ impl Routing {
             Self::SimpleFirewall(inner) => inner.route_server_to_client(transmit, now),
             Self::ManyToMany(inner) => inner.route_server_to_client(transmit, now),
             Self::BwLimited(inner) => inner.route_server_to_client(transmit, now),
+            Self::MixedRoute(inner) => inner.route_server_to_client(transmit, now),
         }
     }
 
@@ -1776,6 +1780,7 @@ impl Routing {
             }
             Self::ManyToMany(many_to_many_routing) => many_to_many_routing.set_latency(latency),
             Self::BwLimited(bw_limited_routing) => bw_limited_routing.set_latency(latency),
+            Self::MixedRoute(inner) => inner.latency = latency,
         }
     }
 }
@@ -2475,5 +2480,132 @@ impl Limiter {
         let experienced_congestion = self.finished_sending_at > now + self.max_queue / 2;
 
         Some((self.finished_sending_at, experienced_congestion))
+    }
+}
+
+/// Lossless FIFO to A; B is a second address on the same server reached directly.
+#[derive(Debug)]
+pub(super) struct MixedRouteRouting {
+    pub(super) shaped: bool,
+    pub(super) departures: VecDeque<Instant>,
+    pub(super) latency: Duration,
+    pub(super) direct_response_latency: Duration,
+    /// Serialization delay per packet on the shaped route.
+    pub(super) spacing: Duration,
+    /// NET-3: independently shape download and hold either FIFO until a simulated instant.
+    pub(super) shape_download: bool,
+    pub(super) download_departures: VecDeque<Instant>,
+    pub(super) hold_upload: Option<Instant>,
+    pub(super) hold_download: Option<Instant>,
+    /// Hold probe responses until all candidate probes have overtaken the data.
+    pub(super) probe_replies_until: Option<Instant>,
+}
+
+impl Default for MixedRouteRouting {
+    fn default() -> Self {
+        Self {
+            shaped: false,
+            departures: VecDeque::new(),
+            latency: Duration::from_millis(100),
+            direct_response_latency: Duration::from_millis(100),
+            spacing: Duration::from_micros(100),
+            shape_download: false,
+            download_departures: VecDeque::new(),
+            hold_upload: None,
+            hold_download: None,
+            probe_replies_until: None,
+        }
+    }
+}
+
+impl MixedRouteRouting {
+    pub(super) const DIRECT: SocketAddr =
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 2, 2)), 1);
+
+    fn route_client_to_server(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
+        let src = transmit
+            .src_ip
+            .map(|ip| SocketAddr::new(ip, 1))
+            .unwrap_or(Pair::CLIENT_ADDR);
+        let reply = src != Pair::CLIENT_ADDR;
+        let recv_time = if transmit.destination == Pair::SERVER_ADDR && !reply {
+            while self.departures.front().is_some_and(|time| *time <= now) {
+                self.departures.pop_front();
+            }
+            let departure = if self.shaped {
+                self.departures
+                    .back()
+                    .copied()
+                    .unwrap_or(now)
+                    .max(now)
+                    .max(self.hold_upload.unwrap_or(now))
+                    + self.spacing
+            } else {
+                now
+            };
+            self.departures.push_back(departure);
+            departure + self.latency
+        } else if reply {
+            self.probe_replies_until.unwrap_or(now).max(now)
+        } else {
+            now
+        };
+        RoutingDecision::Deliver {
+            src,
+            dst: Some(transmit.destination.ip()),
+            recv_time,
+            congestion_experienced: false,
+        }
+    }
+
+    fn route_server_to_client(&mut self, transmit: &Transmit, now: Instant) -> RoutingDecision {
+        let src = transmit
+            .src_ip
+            .map(|ip| SocketAddr::new(ip, 1))
+            .unwrap_or(Pair::SERVER_ADDR);
+        let direct = src != Pair::SERVER_ADDR || transmit.destination != Pair::CLIENT_ADDR;
+        let departure = if self.shape_download && !direct {
+            while self
+                .download_departures
+                .front()
+                .is_some_and(|time| *time <= now)
+            {
+                self.download_departures.pop_front();
+            }
+            let departure = self
+                .download_departures
+                .back()
+                .copied()
+                .unwrap_or(now)
+                .max(now)
+                .max(self.hold_download.unwrap_or(now))
+                + self.spacing;
+            self.download_departures.push_back(departure);
+            departure
+        } else {
+            now
+        };
+        RoutingDecision::Deliver {
+            src,
+            dst: Some(transmit.destination.ip()),
+            recv_time: (departure
+                + if direct {
+                    self.direct_response_latency
+                } else {
+                    self.latency
+                })
+            .max(if src != Pair::SERVER_ADDR {
+                self.probe_replies_until.unwrap_or(now)
+            } else {
+                now
+            }),
+            congestion_experienced: false,
+        }
+    }
+}
+
+impl From<MixedRouteRouting> for Routing {
+    fn from(value: MixedRouteRouting) -> Self {
+        Self::MixedRoute(value)
     }
 }

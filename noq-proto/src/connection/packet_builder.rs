@@ -98,6 +98,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         let number = PacketNumber::new(
             packet_number,
             space.for_path(path_id).largest_acked_packet_pn.unwrap_or(0),
+            conn.n0_nat_traversal.is_negotiated(),
         );
         let header = match level {
             EncryptionLevel::OneRtt => Header::Short {

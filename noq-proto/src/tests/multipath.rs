@@ -2298,3 +2298,344 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn off_path_probe_overtakes_queued_stream() -> TestResult {
+    mixed_route_stream(false)
+}
+
+#[test]
+fn off_path_probe_overtakes_short_packet_numbers() -> TestResult {
+    mixed_route_stream(true)
+}
+
+fn mixed_route_stream(short_prefix: bool) -> TestResult {
+    use super::util::{MixedRouteRouting, Routing};
+    use crate::congestion::CubicConfig;
+    const LEN: usize = 2 * 1024 * 1024;
+    let mut cc = CubicConfig::default();
+    cc.initial_window(4 * 1024 * 1024);
+    let mut cfg = TransportConfig::default();
+    cfg.congestion_controller_factory(Arc::new(cc));
+    cfg.deterministic_packet_numbers(true);
+    cfg.send_window(4 * 1024 * 1024);
+    cfg.stream_receive_window((4 * 1024 * 1024u32).into());
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(cfg)
+        .enable_multipath()
+        .enable_nat_traversal()
+        .disable_mtud_discovery()
+        .with_routes(MixedRouteRouting::default())
+        .connect();
+    pair.add_nat_traversal_address(Server, MixedRouteRouting::DIRECT)?;
+    pair.add_nat_traversal_address(Client, Pair::CLIENT_ADDR)?;
+    pair.drive();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    if let Routing::MixedRoute(route) = &mut pair.routes {
+        route.shaped = true;
+    }
+    // This prefix is encoded before the outstanding flight forces a wider PN.
+    let prefix = if short_prefix { 1200 } else { 0 };
+    if prefix != 0 {
+        assert_eq!(
+            pair.send_stream(Client, stream).write(&vec![42; prefix])?,
+            prefix
+        );
+        pair.drive_client();
+    }
+    assert_eq!(
+        pair.send_stream(Client, stream)
+            .write(&vec![42; LEN - prefix])?,
+        LEN - prefix
+    );
+    pair.send_stream(Client, stream).finish()?;
+    for _ in 0..10000 {
+        pair.drive_client();
+        if let Routing::MixedRoute(route) = &pair.routes
+            && route.departures.len() > 300
+        {
+            break;
+        }
+        assert!(pair.step());
+    }
+    let Routing::MixedRoute(route) = &pair.routes else {
+        unreachable!()
+    };
+    assert!(
+        route.departures.len() > 300,
+        "FIFO must hold more than 300 packets"
+    );
+    assert_eq!(
+        pair.initiate_nat_traversal_round(Client)?,
+        vec![MixedRouteRouting::DIRECT]
+    );
+    let mut received = 0;
+    let mut ended = false;
+    let mut acked = false;
+    for _ in 0..100000 {
+        pair.step();
+        pair.streams(Server).accept(Dir::Uni);
+        if let Ok(mut chunks) = pair.recv_stream(Server, stream).read(false) {
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => {
+                        assert!(chunk.bytes.iter().all(|byte| *byte == 42));
+                        received += chunk.bytes.len();
+                    }
+                    Ok(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(crate::ReadError::Blocked) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = chunks.finalize();
+        }
+        while let Some(event) = pair.conn_mut(Client).poll() {
+            if matches!(event, Event::Stream(StreamEvent::Finished { id }) if id == stream) {
+                acked = true;
+            }
+        }
+        if ended && acked {
+            break;
+        }
+    }
+    let server = pair.stats(Server);
+    let path = pair.path_stats(Client, PathId::ZERO).unwrap();
+    std::eprintln!(
+        "mixed route short_prefix={short_prefix} duplicate_discards={} authentication_drops={} lost_packets={} congestion_events={} received={received}",
+        server.duplicate_discards,
+        server.authentication_drops,
+        path.lost_packets,
+        path.congestion_events
+    );
+    assert_eq!(
+        server.duplicate_discards, 0,
+        "queued packets discarded as duplicates"
+    );
+    assert_eq!(
+        server.authentication_drops, 0,
+        "queued packet PN expansion failed authentication"
+    );
+    assert_eq!(
+        path.lost_packets, 0,
+        "probe ACK declared queued packets lost"
+    );
+    assert_eq!(path.congestion_events, 0);
+    assert_eq!(received, LEN);
+    assert!(ended);
+    assert!(acked, "the complete stream and FIN must be acknowledged");
+    Ok(())
+}
+
+/// Packet numbers are per path, so the receiver's key-update boundary must be too.
+///
+/// Old-phase stream packets sit in path 0's slow FIFO while a PING on a second, direct path
+/// carries the new key phase and arrives first. Its small path-1 packet number must not decide
+/// which keys open the larger path-0 packet numbers queued behind it.
+#[test]
+fn key_update_first_seen_on_fast_path_keeps_queued_old_phase() -> TestResult {
+    key_update_with_queued_old_phase(super::util::MixedRouteRouting::default())
+}
+
+/// The slow flight outlives three fast-path PTOs, but must retain its old-phase keys.
+#[test]
+fn key_discard_waits_for_slow_path_old_phase_packets() -> TestResult {
+    key_update_with_queued_old_phase(super::util::MixedRouteRouting {
+        latency: Duration::from_secs(1),
+        direct_response_latency: Duration::ZERO,
+        ..Default::default()
+    })
+}
+
+/// A slow route drains old-phase packets for longer than three PTOs after the new key phase
+/// overtook them on the direct route. The server's PTO was measured before the queue built, so
+/// only the old-phase packets still arriving show that the reordering lasts longer.
+#[test]
+fn key_discard_waits_while_old_phase_packets_keep_arriving() -> TestResult {
+    use super::util::{MixedRouteRouting, Routing};
+    const LEN: usize = 32 * 1024;
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(MixedRouteRouting {
+            latency: Duration::from_millis(10),
+            direct_response_latency: Duration::from_millis(10),
+            spacing: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .connect();
+    let fast = pair.open_path(
+        Client,
+        FourTuple::from_remote(MixedRouteRouting::DIRECT),
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    if let Routing::MixedRoute(route) = &mut pair.routes {
+        route.shaped = true;
+    }
+    assert_eq!(pair.send_stream(Client, stream).write(&[42; LEN])?, LEN);
+    pair.send_stream(Client, stream).finish()?;
+    // Old-phase packets leave on path 0 and queue on the shaped route, 50 ms apart.
+    pair.drive_client();
+    pair.force_key_update(Client);
+    pair.conn_mut(Client).ping_path(fast)?;
+    // The new-phase PING takes the direct route and arms the server's key-discard timer.
+    pair.drive_client();
+    pair.drive_server();
+    pair.conn(Server)
+        .timer_pending(Timer::Conn(crate::connection::timer::ConnTimer::KeyDiscard))
+        .expect("key discard armed");
+    // The RFC 9001 § 6.5 deadline: 3 × PTO after the first new-phase packet.
+    let armed = pair.time + pair.conn(Server).base_pto() * 3;
+    let drained = match &pair.routes {
+        Routing::MixedRoute(route) => route.departures.back().copied(),
+        _ => None,
+    }
+    .expect("old-phase packets queued");
+    std::eprintln!(
+        "key_discard_queue armed_in={:?} drained_in={:?}",
+        armed - pair.time,
+        drained - pair.time,
+    );
+    assert!(
+        armed < drained,
+        "premise: the queue drains after the initial discard deadline"
+    );
+    let mut received = 0;
+    let mut ended = false;
+    for _ in 0..10000 {
+        if !pair.step() && ended {
+            break;
+        }
+        pair.streams(Server).accept(Dir::Uni);
+        if let Ok(mut chunks) = pair.recv_stream(Server, stream).read(false) {
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => received += chunk.bytes.len(),
+                    Ok(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(crate::ReadError::Blocked) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = chunks.finalize();
+        }
+    }
+    let drops = pair.stats(Server).authentication_drops;
+    std::eprintln!("key_discard_queue authentication_drops={drops} received={received}");
+    assert_eq!(
+        drops, 0,
+        "queued old-phase packets dropped after a key discard"
+    );
+    assert_eq!(received, LEN);
+    assert!(ended);
+    Ok(())
+}
+
+fn key_update_with_queued_old_phase(routes: super::util::MixedRouteRouting) -> TestResult {
+    use super::util::{MixedRouteRouting, Routing};
+    const LEN: usize = 64 * 1024;
+    let warm_fast_path = routes.direct_response_latency.is_zero();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(routes)
+        .connect();
+    let fast = pair.open_path(
+        Client,
+        FourTuple::from_remote(MixedRouteRouting::DIRECT),
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+    assert!(
+        pair.path_stats(Server, fast).is_some(),
+        "direct path opened"
+    );
+    if warm_fast_path {
+        // ACKs may use another path. Put both endpoints on the direct route while
+        // measuring it, then restore only the client's slow upload route.
+        for side in [Client, Server] {
+            pair.set_path_status(side, fast, PathStatus::Available)?;
+            pair.set_path_status(side, PathId::ZERO, PathStatus::Backup)?;
+        }
+        pair.drive();
+        for _ in 0..64 {
+            pair.ping_path(Client, fast)?;
+            pair.ping_path(Server, fast)?;
+            pair.drive();
+        }
+        pair.set_path_status(Client, PathId::ZERO, PathStatus::Available)?;
+        pair.set_path_status(Client, fast, PathStatus::Backup)?;
+    }
+    // Record the test's timing premise; the oracle below is delivery without drops.
+    std::eprintln!(
+        "key_update_routes slow_rtt={:?} fast_rtt={:?} max_pto={:?}",
+        pair.rtt(Server, PathId::ZERO).unwrap(),
+        pair.rtt(Server, fast).unwrap(),
+        pair.conn(Server).base_pto(),
+    );
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    if let Routing::MixedRoute(route) = &mut pair.routes {
+        route.shaped = true;
+    }
+    assert_eq!(pair.send_stream(Client, stream).write(&[42; LEN])?, LEN);
+    pair.send_stream(Client, stream).finish()?;
+    // Old-phase packets leave on path 0 and queue in the FIFO.
+    pair.drive_client();
+    pair.force_key_update(Client);
+    pair.conn_mut(Client).ping_path(fast)?;
+    // The new-phase PING takes the direct route and overtakes them.
+    pair.drive_client();
+    pair.drive_server();
+    if let Some(deadline) = pair
+        .conn(Server)
+        .timer_pending(Timer::Conn(crate::connection::timer::ConnTimer::KeyDiscard))
+    {
+        std::eprintln!("key_discard_after={:?}", deadline - pair.time);
+    }
+    let mut received = 0;
+    let mut ended = false;
+    for _ in 0..10000 {
+        if !pair.step() && ended {
+            break;
+        }
+        pair.streams(Server).accept(Dir::Uni);
+        if let Ok(mut chunks) = pair.recv_stream(Server, stream).read(false) {
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => received += chunk.bytes.len(),
+                    Ok(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(crate::ReadError::Blocked) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let _ = chunks.finalize();
+        }
+    }
+    let server = pair.stats(Server);
+    let client = pair.stats(Client);
+    let path = pair.path_stats(Client, PathId::ZERO).unwrap();
+    std::eprintln!(
+        "key_update_delivery authentication_drops={} client_authentication_drops={} lost_packets={} received={received} ended={ended}",
+        server.authentication_drops,
+        client.authentication_drops,
+        path.lost_packets,
+    );
+    assert_eq!(
+        server.authentication_drops, 0,
+        "queued old-phase packets opened with the wrong keys"
+    );
+    assert_eq!(client.authentication_drops, 0);
+    assert_eq!(path.lost_packets, 0);
+    assert_eq!(received, LEN);
+    assert!(ended);
+    Ok(())
+}

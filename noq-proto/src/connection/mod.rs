@@ -312,6 +312,9 @@ pub struct Connection {
 
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
+    /// `Dedup` ranges per path: every off-path probe the peer may send in one traversal round
+    /// can land as its own out-of-order island ahead of queued packets (C-1492).
+    dedup_max_ranges: usize,
     qlog: QlogSink,
 }
 
@@ -442,6 +445,7 @@ impl Connection {
             abandoned_paths: Default::default(),
 
             n0_nat_traversal: Default::default(),
+            dedup_max_ranges: 0,
             qlog,
         };
         if path_validated {
@@ -2778,9 +2782,14 @@ impl Connection {
             debug!("ignoring forced key update in illegal state");
             return;
         }
-        if self.crypto_state.prev_crypto.is_some() {
-            // We already just updated, or are currently updating, the keys. Concurrent key updates
-            // are illegal.
+        if self.crypto_state.prev_crypto.is_some()
+            && self
+                .crypto_state
+                .remaining_packet_budget(EncryptionLevel::OneRtt)
+                != Some(0)
+        {
+            // Retained keys defer voluntary updates, but must not delay the scheduled update
+            // at phase exhaustion (C-1512 (e)). update_keys releases them through the shared path.
             debug!("ignoring redundant forced key update");
             return;
         }
@@ -2790,6 +2799,17 @@ impl Connection {
     /// Get a session reference
     pub fn crypto_session(&self) -> &dyn crypto::Session {
         self.crypto_state.session.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn packet_keys_for_test(
+        &mut self,
+    ) -> &mut crypto::KeyPair<Box<dyn crypto::PacketKey>> {
+        &mut self.crypto_state.spaces[SpaceKind::Data]
+            .keys
+            .as_mut()
+            .unwrap()
+            .packet
     }
 
     /// Whether the connection is in the process of being established
@@ -3011,26 +3031,6 @@ impl Connection {
         if ack.largest >= self.spaces[space].for_path(path).next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
-        // `Some(pn)` if this ACK raised `largest_acked_packet_pn`.
-        let new_largest_pn = {
-            let space = &mut self.spaces[space].for_path(path);
-            if space
-                .largest_acked_packet_pn
-                .is_none_or(|pn| ack.largest > pn)
-            {
-                space.largest_acked_packet_pn = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(ack.largest) {
-                    // This should always succeed, but a misbehaving peer might ACK a packet we
-                    // haven't sent. At worst, that will result in us spuriously reducing the
-                    // congestion window.
-                    space.largest_acked_packet_send_time = info.time_sent;
-                }
-                Some(ack.largest)
-            } else {
-                None
-            }
-        };
-
         if self.detect_spurious_loss(&ack, space, path) {
             self.path_stats.get_mut(path).spurious_congestion_events += 1;
             self.path_data_mut(path)
@@ -3070,6 +3070,22 @@ impl Connection {
             self.set_late_stream_timer(now);
             return Ok(());
         }
+
+        // Off-path probes are untracked: their ACKs cannot advance recovery or RTT.
+        let new_largest_pn = {
+            let space = &mut self.spaces[space].for_path(path);
+            if let Some(pn) = newly_acked
+                .max()
+                .filter(|&pn| space.largest_acked_packet_pn.is_none_or(|old| pn > old))
+                && let Some(info) = space.sent_packets.get(pn)
+            {
+                space.largest_acked_packet_send_time = info.time_sent;
+                space.largest_acked_packet_pn = Some(pn);
+                Some(pn)
+            } else {
+                None
+            }
+        };
 
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
@@ -3298,24 +3314,30 @@ impl Connection {
         }
     }
 
+    /// Discard temporary keys three times the largest PTO after all pre-update paths have
+    /// delivered a verified new-phase packet, bounded by the absolute C-1509 cap.
+    /// Also schedules the discard of 0-RTT keys after the first 1-RTT packet.
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceKind) {
-        let start = if self.crypto_state.has_keys(EncryptionLevel::ZeroRtt) {
-            now
-        } else {
-            self.crypto_state
-                .prev_crypto
-                .as_ref()
-                .expect("no previous keys")
-                .end_packet
-                .as_ref()
-                .expect("update not acknowledged yet")
-                .1
-        };
-
-        // QUIC-MULTIPATH § 2.5 Key Phase Update Process: use largest PTO of all paths.
+        let mut deadline = now + self.max_pto_for_space(space) * 3;
+        if let Some(prev) = self.crypto_state.prev_crypto.as_mut()
+            && let Some(ends) = &prev.end_packets
+        {
+            // C-1512 retains pending paths, but never beyond the C-1509 cap.
+            let cap = self
+                .idle_timeout
+                .unwrap_or(Duration::from_secs(30))
+                .min(Duration::from_secs(30));
+            let cap = *prev.discard_deadline.get_or_insert(now + cap);
+            // A path that predates the update and has not delivered a newer packet may still
+            // be queueing older ones: keep the keys until it does, or the cap.
+            deadline = match ends.values().any(Option::is_none) {
+                true => cap,
+                false => deadline.min(cap),
+            };
+        }
         self.timers.set(
             Timer::Conn(ConnTimer::KeyDiscard),
-            start + self.max_pto_for_space(space) * 3,
+            deadline,
             self.qlog.with_time(now),
         );
     }
@@ -3531,6 +3553,15 @@ impl Connection {
         self.partial_stats += path_stats;
         self.paths.remove(&path_id);
         self.spaces[SpaceId::Data].number_spaces.remove(&path_id);
+        if let Some(ends) = self
+            .crypto_state
+            .prev_crypto
+            .as_mut()
+            .and_then(|prev| prev.end_packets.as_mut())
+            && ends.remove(&path_id) == Some(None)
+        {
+            self.set_key_discard_timer(now, SpaceKind::Data);
+        }
 
         self.events.push_back(
             PathEvent::Discarded {
@@ -4389,7 +4420,7 @@ impl Connection {
         let decrypted = match packet {
             None => Err(None),
             Some(mut packet) => self
-                .decrypt_packet(now, path_id, &mut packet)
+                .decrypt_packet(now, network_path, path_id, &mut packet)
                 .map(move |number| (packet, number)),
         };
         let result = match decrypted {
@@ -4404,6 +4435,10 @@ impl Connection {
             Err(None) => {
                 debug!("failed to authenticate packet");
                 self.authentication_failures += 1;
+                #[cfg(test)]
+                {
+                    self.partial_stats.authentication_drops += 1;
+                }
                 let integrity_limit = self
                     .crypto_state
                     .integrity_limit(self.highest_space)
@@ -4461,11 +4496,20 @@ impl Connection {
                 let dedup = self.spaces[packet.header.space()]
                     .path_space_mut(path_id)
                     .map(|pns| &mut pns.dedup);
-                if pn.zip(dedup).is_some_and(|(n, d)| d.insert(n)) {
+                let max_ranges = self.dedup_max_ranges;
+                if pn.zip(dedup).is_some_and(|(n, d)| {
+                    d.max_ranges = max_ranges;
+                    d.insert(n)
+                }) {
                     debug!("discarding possible duplicate packet");
+                    #[cfg(test)]
+                    {
+                        self.partial_stats.duplicate_discards += 1;
+                    }
                     self.qlog.emit_packet_received(qlog, now);
                     return;
-                } else if self.state.is_handshake() && packet.header.is_short() {
+                }
+                if self.state.is_handshake() && packet.header.is_short() {
                     // TODO: SHOULD buffer these to improve reordering tolerance.
                     trace!("dropping short packet during handshake");
                     self.qlog.emit_packet_received(qlog, now);
@@ -6812,6 +6856,7 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
+        self.crypto_state.discard_temporary_keys();
         self.timers.reset();
         self.late_streams = spaces::LateStreams::default();
     }
@@ -6903,6 +6948,8 @@ impl Connection {
             if multipath_enabled {
                 let max_local_addresses = max_remotely_allowed_remote_addresses.get();
                 let max_remote_addresses = max_locally_allowed_remote_addresses.get();
+                self.dedup_max_ranges = usize::from(max_local_addresses)
+                    * usize::from(n0_nat_traversal::MAX_NAT_PROBE_ATTEMPTS);
                 self.n0_nat_traversal = n0_nat_traversal::State::new(
                     max_remote_addresses,
                     max_local_addresses,
@@ -6935,6 +6982,7 @@ impl Connection {
     fn decrypt_packet(
         &mut self,
         now: Instant,
+        network_path: FourTuple,
         path_id: PathId,
         packet: &mut Packet,
     ) -> Result<Option<u64>, Option<TransportError>> {
@@ -6946,18 +6994,37 @@ impl Connection {
             return Ok(None);
         };
 
+        // Every path that exists when the first newer packet arrives must deliver one too.
+        let pn = result.packet_number;
+        // First new-phase receipt starts the cap even if it cannot resolve this route.
+        let mut arm_discard = result.outgoing_key_update_acked || result.incoming_key_update;
+        let ends = || self.paths.keys().map(|path| (*path, None)).collect();
         if result.outgoing_key_update_acked
             && let Some(prev) = self.crypto_state.prev_crypto.as_mut()
         {
-            prev.end_packet = Some((result.packet_number, now));
-            self.set_key_discard_timer(now, packet.header.space());
+            prev.end_packets = Some(ends());
         }
-
         if result.incoming_key_update {
             trace!("key update authenticated");
-            self.crypto_state
-                .update_keys(Some((result.packet_number, now)), true);
-            self.set_key_discard_timer(now, packet.header.space());
+            let ends = ends();
+            self.crypto_state.update_keys(Some(ends), true);
+        }
+        // Only a packet on the path's own 4-tuple shows that route has drained the older phase;
+        // an off-path probe in this packet number space overtakes it (QUIC-MULTIPATH § 2.5).
+        if packet.header.is_short()
+            && packet.header.key_phase() == self.crypto_state.key_phase
+            && self
+                .path(path_id)
+                .is_none_or(|path| path.network_path.is_probably_same_path(&network_path))
+            && let Some(prev) = self.crypto_state.prev_crypto.as_mut()
+            && let Some(ends) = prev.end_packets.as_mut()
+        {
+            let end = ends.entry(path_id).or_insert(Some(pn));
+            arm_discard |= end.is_none();
+            *end = Some(end.map_or(pn, |end| end.min(pn)));
+        }
+        if arm_discard {
+            self.set_key_discard_timer(now, SpaceKind::Data);
         }
 
         Ok(Some(result.packet_number))
@@ -7204,6 +7271,7 @@ impl Connection {
                 .for_path(path)
                 .largest_acked_packet_pn
                 .unwrap_or(0),
+            self.n0_nat_traversal.is_negotiated(),
         )
         .len();
 

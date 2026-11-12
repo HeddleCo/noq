@@ -317,6 +317,10 @@ pub struct ConnectionStats {
     /// Number of [`super::Transmit`] produced by this connection.
     #[cfg(test)]
     pub(crate) transmits_tx: u64,
+    #[cfg(test)]
+    pub(crate) duplicate_discards: u64,
+    #[cfg(test)]
+    pub(crate) authentication_drops: u64,
 }
 
 impl core::ops::Add<PathStats> for ConnectionStats {
@@ -355,6 +359,10 @@ impl core::ops::Add<PathStats> for ConnectionStats {
             lost_bytes: self.lost_bytes + lost_bytes,
             #[cfg(test)]
             transmits_tx: self.transmits_tx,
+            #[cfg(test)]
+            duplicate_discards: self.duplicate_discards,
+            #[cfg(test)]
+            authentication_drops: self.authentication_drops,
         }
     }
 }
@@ -393,6 +401,10 @@ impl core::ops::AddAssign<PathStats> for ConnectionStats {
             lost_bytes,
             #[cfg(test)]
                 transmits_tx: _,
+            #[cfg(test)]
+                duplicate_discards: _,
+            #[cfg(test)]
+                authentication_drops: _,
         } = self;
         *udp_tx += path_udp_tx;
         *udp_rx += path_udp_rx;
