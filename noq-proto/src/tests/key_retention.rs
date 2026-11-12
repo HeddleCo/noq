@@ -400,3 +400,86 @@ fn key_retention_scheduled_update_releases_pending_paths() -> TestResult {
     assert!(!flight.pair.conn(Server).is_closed());
     Ok(())
 }
+
+/// NAT rebinding's first packet migrates the route; only its successor drains the old phase.
+#[test]
+fn key_retention_rebinding_requires_packet_after_migration() -> TestResult {
+    let mut flight = Flight::new(None)?;
+    let cap = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
+    let rebound = flight.pair.routes.as_basic_mut().passive_migration(Client);
+    let mut first = flight.current.clone();
+    first.remote = rebound;
+    flight.deliver(flight.first + Duration::from_millis(500), first);
+    assert_eq!(
+        flight.pair.datagrams(Server).recv().unwrap(),
+        b"current"[..]
+    );
+    assert_eq!(
+        flight.pair.network_path(Server, PathId::ZERO)?.remote,
+        rebound
+    );
+    assert_eq!(
+        flight.pair.conn(Server).timer_pending(DISCARD),
+        Some(cap),
+        "first packet from the new tuple resolved the pending path"
+    );
+    flight
+        .pair
+        .datagrams(Client)
+        .send(Bytes::from_static(b"after migration"), false)?;
+    flight.pair.drive_client();
+    flight.pair.time += Duration::from_millis(500);
+    flight.pair.drive_server();
+    assert_eq!(
+        flight.pair.datagrams(Server).recv().unwrap(),
+        b"after migration"[..]
+    );
+    let deadline = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
+    assert!(
+        deadline < cap,
+        "the packet after migration did not resolve the path"
+    );
+    flight.pair.conn_mut(Server).handle_timeout(deadline);
+    assert_eq!(flight.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(flight.pair.stats(Server).authentication_drops, 0);
+    assert!(!flight.pair.conn(Server).is_closed());
+    Ok(())
+}
+
+/// Even a first phase receipt from a foreign tuple starts the unchanged absolute cap.
+#[test]
+fn key_retention_first_offroute_packet_starts_cap() -> TestResult {
+    let mut cfg = TransportConfig::default();
+    cfg.max_idle_timeout(None);
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(cfg)
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let key = &mut pair.conn_mut(Server).packet_keys_for_test().remote;
+    let dropped = observe(key, u64::MAX, None);
+    pair.force_key_update(Client);
+    let rebound = pair.routes.as_basic_mut().passive_migration(Client);
+    pair.datagrams(Client)
+        .send(Bytes::from_static(b"first phase packet"), false)?;
+    pair.drive_client();
+    pair.drive_server();
+    let first = pair.time;
+    assert_eq!(pair.network_path(Server, PathId::ZERO)?.remote, rebound);
+    assert_eq!(
+        pair.datagrams(Server).recv().unwrap(),
+        b"first phase packet"[..]
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    // Withhold every subsequent packet, so only the absolute cap can release the keys.
+    let cap = first + Duration::from_secs(30);
+    pair.time = cap;
+    pair.conn_mut(Server).handle_timeout(cap);
+    assert!(!pair.conn(Server).is_closed());
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "first off-route phase receipt did not start the absolute cap"
+    );
+    Ok(())
+}

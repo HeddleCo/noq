@@ -4420,7 +4420,7 @@ impl Connection {
         let decrypted = match packet {
             None => Err(None),
             Some(mut packet) => self
-                .decrypt_packet(now, path_id, &mut packet)
+                .decrypt_packet(now, network_path, path_id, &mut packet)
                 .map(move |number| (packet, number)),
         };
         let result = match decrypted {
@@ -6982,6 +6982,7 @@ impl Connection {
     fn decrypt_packet(
         &mut self,
         now: Instant,
+        network_path: FourTuple,
         path_id: PathId,
         packet: &mut Packet,
     ) -> Result<Option<u64>, Option<TransportError>> {
@@ -6995,6 +6996,8 @@ impl Connection {
 
         // Every path that exists when the first newer packet arrives must deliver one too.
         let pn = result.packet_number;
+        // First new-phase receipt starts the cap even if it cannot resolve this route.
+        let mut arm_discard = result.outgoing_key_update_acked || result.incoming_key_update;
         let ends = || self.paths.keys().map(|path| (*path, None)).collect();
         if result.outgoing_key_update_acked
             && let Some(prev) = self.crypto_state.prev_crypto.as_mut()
@@ -7006,17 +7009,22 @@ impl Connection {
             let ends = ends();
             self.crypto_state.update_keys(Some(ends), true);
         }
+        // Only a packet on the path's own 4-tuple shows that route has drained the older phase;
+        // an off-path probe in this packet number space overtakes it (QUIC-MULTIPATH § 2.5).
         if packet.header.is_short()
             && packet.header.key_phase() == self.crypto_state.key_phase
+            && self
+                .path(path_id)
+                .is_none_or(|path| path.network_path.is_probably_same_path(&network_path))
             && let Some(prev) = self.crypto_state.prev_crypto.as_mut()
             && let Some(ends) = prev.end_packets.as_mut()
         {
             let end = ends.entry(path_id).or_insert(Some(pn));
-            let pending = end.is_none();
+            arm_discard |= end.is_none();
             *end = Some(end.map_or(pn, |end| end.min(pn)));
-            if pending {
-                self.set_key_discard_timer(now, SpaceKind::Data);
-            }
+        }
+        if arm_discard {
+            self.set_key_discard_timer(now, SpaceKind::Data);
         }
 
         Ok(Some(result.packet_number))

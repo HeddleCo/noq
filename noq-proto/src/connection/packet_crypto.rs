@@ -48,8 +48,8 @@ pub(super) struct PrevCrypto {
     /// Per path, the lowest packet number received using newer keys, which ends the interval for
     /// which these keys are applicable on that path (packet numbers are per path, QUIC-MULTIPATH
     /// § 2.5). A path that existed when the first newer packet arrived maps to `None` until it
-    /// delivers one; until then these keys stay (C-1509 cap), since anything queued on that path
-    /// still needs them.
+    /// delivers one on its own 4-tuple (an off-path probe overtakes that route); until then these
+    /// keys stay (C-1509 cap), since anything queued on that path still needs them.
     ///
     /// Incoming packets should be decrypted using these keys iff this is `None`, their path has
     /// no end yet, or their packet number is lower. `None` indicates that we have not yet
