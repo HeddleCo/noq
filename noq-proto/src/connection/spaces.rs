@@ -965,8 +965,8 @@ impl ThinRetransmits {
 
 /// Exact replay tracking above a bounded retention floor.
 ///
-/// The newest 129 PNs use a bitmap. Older received PNs live in at most 32 ranges;
-/// evicting the oldest range raises the floor, never admitting a replay.
+/// The newest 129 PNs use a bitmap. Older received PNs live in at most `max_ranges` (at
+/// least 32) ranges; evicting the oldest range raises the floor, never admitting a replay.
 #[derive(Debug, Default)]
 pub(super) struct Dedup {
     window: Window,
@@ -975,6 +975,8 @@ pub(super) struct Dedup {
     older: ArrayRangeSet,
     /// Lowest packet number higher than all yet authenticated.
     next: u64,
+    /// Out-of-order islands to keep before folding: the peer's off-path probe budget.
+    pub(super) max_ranges: usize,
 }
 
 impl Dedup {
@@ -1031,7 +1033,8 @@ impl Dedup {
 
     fn remember(&mut self, packet: u64) -> bool {
         let duplicate = !self.older.insert_one(packet);
-        if (self.older.range_count() > 32 || self.older.min() == Some(self.floor))
+        if (self.older.range_count() > self.max_ranges.max(32)
+            || self.older.min() == Some(self.floor))
             && let Some(oldest) = self.older.pop_min()
         {
             self.floor = oldest.end;
@@ -1512,9 +1515,14 @@ mod test {
 
     proptest::proptest! {
         #[test]
-        fn dedup_exact_set_and_floor(ops in proptest::collection::vec(0u64..8192, 0..400)) {
+        fn dedup_exact_set_and_floor(
+            ops in proptest::collection::vec(0u64..8192, 0..400),
+            max_ranges in proptest::sample::select(vec![0usize, 40]),
+        ) {
             use crate::HashSet;
             let mut dedup = Dedup::new();
+            dedup.max_ranges = max_ranges;
+            let cap = max_ranges.max(32);
             let mut seen = HashSet::new();
             let mut floor = 0;
             let mut next = 0;
@@ -1533,11 +1541,11 @@ mod test {
                     if let Some(run) = runs.last_mut().filter(|run| run.end == n) { run.end += 1; }
                     else { runs.push(n..n+1); }
                 }
-                while runs.len() > 32 || runs.first().is_some_and(|r| r.start == floor) {
+                while runs.len() > cap || runs.first().is_some_and(|r| r.start == floor) {
                     floor = runs.remove(0).end;
                 }
                 proptest::prop_assert_eq!(dedup.floor, floor);
-                proptest::prop_assert!(dedup.older.range_count() <= 32);
+                proptest::prop_assert!(dedup.older.range_count() <= cap);
                 let high = next - 1;
                 let lower = seen.iter().copied().filter(|n| *n >= floor).min().unwrap_or(high);
                 let middle = seen.iter().copied().filter(|n| *n >= floor && *n <= pn).max().unwrap_or(lower);
@@ -1548,7 +1556,7 @@ mod test {
                 // Replays on both sides of the floor must always be rejected.
                 proptest::prop_assert!(dedup.insert(pn));
             }
-            proptest::prop_assert!(floor >= 95, "the cap fold must have been exercised");
+            proptest::prop_assert!(floor as usize >= 2 * (80 - cap) - 1, "the cap fold must have been exercised");
         }
     }
 

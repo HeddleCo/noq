@@ -1,4 +1,4 @@
-//! C-1509 bounds, exercised with real encrypted packets and the simulated clock.
+//! C-1509/C-1512 bounds, exercised with real encrypted packets and the simulated clock.
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -13,7 +13,8 @@ use testresult::TestResult;
 use crate::connection::timer::{ConnTimer, Timer};
 use crate::crypto::{CryptoError, PacketKey};
 use crate::{
-    ConnectionError, Event, Instant, PathId, Side::*, TransportConfig, TransportErrorCode,
+    ConnectionError, Event, FourTuple, Instant, PathId, PathStatus, Side::*, TransportConfig,
+    TransportErrorCode,
 };
 
 use super::util::{ConnPair, Inbound, server_config};
@@ -25,6 +26,7 @@ struct ObservedKey {
     inner: Option<Box<dyn PacketKey>>,
     dropped: Arc<AtomicUsize>,
     integrity_limit: u64,
+    confidentiality_limit: Option<u64>,
 }
 
 impl Drop for ObservedKey {
@@ -58,14 +60,19 @@ impl PacketKey for ObservedKey {
         self.inner.as_ref().unwrap().tag_len()
     }
     fn confidentiality_limit(&self) -> u64 {
-        self.inner.as_ref().unwrap().confidentiality_limit()
+        self.confidentiality_limit
+            .unwrap_or_else(|| self.inner.as_ref().unwrap().confidentiality_limit())
     }
     fn integrity_limit(&self) -> u64 {
         self.integrity_limit
     }
 }
 
-fn observe(key: &mut Box<dyn PacketKey>, limit: u64) -> Arc<AtomicUsize> {
+fn observe(
+    key: &mut Box<dyn PacketKey>,
+    limit: u64,
+    confidentiality_limit: Option<u64>,
+) -> Arc<AtomicUsize> {
     let dropped = Arc::new(AtomicUsize::new(0));
     let inner = mem::replace(
         key,
@@ -73,18 +80,21 @@ fn observe(key: &mut Box<dyn PacketKey>, limit: u64) -> Arc<AtomicUsize> {
             inner: None,
             dropped: dropped.clone(),
             integrity_limit: limit,
+            confidentiality_limit,
         }),
     );
     *key = Box::new(ObservedKey {
         inner: Some(inner),
         dropped: dropped.clone(),
         integrity_limit: limit,
+        confidentiality_limit,
     });
     dropped
 }
 
 struct Flight {
     pair: ConnPair,
+    fast: PathId,
     old: Vec<Inbound>,
     current: Inbound,
     first: Instant,
@@ -101,6 +111,7 @@ impl Flight {
         cfg.mtu_discovery_config(None);
         cfg.congestion_controller_factory(Arc::new(cc));
         cfg.initial_key_phase_size(Some(u64::MAX));
+        cfg.max_concurrent_multipath_paths(2);
         // Only the client proposes an idle timeout. The server must use the negotiated
         // value even though its local timeout is disabled.
         let mut server_transport = cfg.clone();
@@ -113,8 +124,15 @@ impl Flight {
             .with_latency(Duration::from_millis(500))
             .disable_mtud_discovery()
             .connect();
+        // Confirm the update on a second path while path 0's genuine old flight stays silent.
+        let fast = pair.open_path(
+            Client,
+            FourTuple::from_remote(pair.routes.public_server_addr()),
+            PathStatus::Backup,
+        )?;
+        pair.drive();
         let key = &mut pair.conn_mut(Server).packet_keys_for_test().remote;
-        let dropped = observe(key, u64::MAX);
+        let dropped = observe(key, u64::MAX, None);
         let mut old = Vec::new();
         // These are distinct authenticated packets, held by the network rather than replayed.
         for i in 0..48 {
@@ -126,7 +144,7 @@ impl Flight {
         }
         assert!(old.len() >= 40, "enough old packets for the 30 s cap");
         pair.force_key_update(Client);
-        pair.conn_mut(Client).ping();
+        pair.conn_mut(Client).ping_path(fast)?;
         pair.drive_client();
         pair.time += Duration::from_millis(500);
         pair.drive_server();
@@ -141,6 +159,7 @@ impl Flight {
         pair.server.inbound.clear();
         Ok(Self {
             pair,
+            fast,
             old,
             current,
             first,
@@ -201,8 +220,10 @@ fn key_retention_further_phase_change_discards_previous() -> TestResult {
     // Our existing update guard forbids another local phase change until discard.
     flight.pair.force_key_update(Server);
     assert_eq!(flight.dropped.load(Ordering::SeqCst), 0);
-    // Confirm the client's first update, then expire only its retention. Genuine old
-    // packets extend the server's retention past the client's independent deadline.
+    // Resolve both client paths, then expire only its retention. The server's path 0
+    // is still pending, so its old keys survive the client's independent deadline.
+    flight.pair.conn_mut(Server).ping_path(PathId::ZERO)?;
+    flight.pair.conn_mut(Server).ping_path(flight.fast)?;
     flight.pair.time += Duration::from_millis(500);
     flight.pair.drive_server();
     flight.pair.time += Duration::from_millis(500);
@@ -217,10 +238,16 @@ fn key_retention_further_phase_change_discards_previous() -> TestResult {
     let packet = flight.old.remove(0);
     flight.deliver(last_old, packet);
     assert!(flight.pair.datagrams(Server).recv().is_some());
+    // Confirm phase one on the slow path before phase two can overtake it there.
+    flight.deliver(last_old, flight.current.clone());
+    assert_eq!(
+        flight.pair.datagrams(Server).recv().unwrap(),
+        b"current"[..]
+    );
     flight.pair.time = client_deadline;
     flight.pair.conn_mut(Client).handle_timeout(client_deadline);
     flight.pair.force_key_update(Client);
-    flight.pair.conn_mut(Client).ping();
+    flight.pair.conn_mut(Client).ping_path(flight.fast)?;
     flight.pair.drive_client();
     flight.pair.time += Duration::from_millis(500);
     flight.pair.drive_server();
@@ -246,7 +273,7 @@ fn key_retention_further_phase_change_discards_previous() -> TestResult {
 fn key_retention_integrity_limit_counts_failed_previous_key_decryptions() -> TestResult {
     let mut flight = Flight::new(None)?;
     let key = &mut flight.pair.conn_mut(Server).packet_keys_for_test().local;
-    observe(key, 2);
+    observe(key, 2, None);
     let mut corrupt = flight.old.remove(0);
     // Damage the tag, outside the header-protection sample; the old-key selector is unchanged.
     let last = corrupt.packet.len() - 1;
@@ -331,6 +358,128 @@ fn key_retention_close_discards_previous_keys() -> TestResult {
         flight.dropped.load(Ordering::SeqCst),
         1,
         "closing cancelled the cap but retained its key"
+    );
+    Ok(())
+}
+
+/// A pending slow path must not postpone the sender's scheduled phase change.
+#[test]
+fn key_retention_scheduled_update_releases_pending_paths() -> TestResult {
+    let mut flight = Flight::new(None)?;
+    // Confirm this phase on both client paths while the server's slow path remains pending.
+    flight.pair.conn_mut(Server).ping_path(PathId::ZERO)?;
+    flight.pair.conn_mut(Server).ping_path(flight.fast)?;
+    flight.pair.drive_server();
+    flight.pair.time += Duration::from_millis(500);
+    flight.pair.drive_client();
+    // This phase has sent packets already; a one-packet budget makes the next update due.
+    let key = &mut flight.pair.conn_mut(Server).packet_keys_for_test().local;
+    observe(key, u64::MAX, Some(1));
+    let deadline = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
+    assert!(deadline > flight.pair.time);
+    assert_eq!(flight.dropped.load(Ordering::SeqCst), 0);
+
+    flight
+        .pair
+        .datagrams(Server)
+        .send(Bytes::from_static(b"scheduled update"), false)?;
+    flight.pair.drive_server();
+    assert_eq!(
+        flight.dropped.load(Ordering::SeqCst),
+        1,
+        "scheduled update was blocked by retained previous keys"
+    );
+    assert!(flight.pair.time < deadline, "update waited for key discard");
+    flight.pair.time += Duration::from_millis(500);
+    flight.pair.drive_client();
+    assert_eq!(
+        flight.pair.datagrams(Client).recv().unwrap(),
+        b"scheduled update"[..]
+    );
+    assert_eq!(flight.pair.stats(Client).authentication_drops, 0);
+    assert!(!flight.pair.conn(Server).is_closed());
+    Ok(())
+}
+
+/// NAT rebinding's first packet migrates the route; only its successor drains the old phase.
+#[test]
+fn key_retention_rebinding_requires_packet_after_migration() -> TestResult {
+    let mut flight = Flight::new(None)?;
+    let cap = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
+    let rebound = flight.pair.routes.as_basic_mut().passive_migration(Client);
+    let mut first = flight.current.clone();
+    first.remote = rebound;
+    flight.deliver(flight.first + Duration::from_millis(500), first);
+    assert_eq!(
+        flight.pair.datagrams(Server).recv().unwrap(),
+        b"current"[..]
+    );
+    assert_eq!(
+        flight.pair.network_path(Server, PathId::ZERO)?.remote,
+        rebound
+    );
+    assert_eq!(
+        flight.pair.conn(Server).timer_pending(DISCARD),
+        Some(cap),
+        "first packet from the new tuple resolved the pending path"
+    );
+    flight
+        .pair
+        .datagrams(Client)
+        .send(Bytes::from_static(b"after migration"), false)?;
+    flight.pair.drive_client();
+    flight.pair.time += Duration::from_millis(500);
+    flight.pair.drive_server();
+    assert_eq!(
+        flight.pair.datagrams(Server).recv().unwrap(),
+        b"after migration"[..]
+    );
+    let deadline = flight.pair.conn(Server).timer_pending(DISCARD).unwrap();
+    assert!(
+        deadline < cap,
+        "the packet after migration did not resolve the path"
+    );
+    flight.pair.conn_mut(Server).handle_timeout(deadline);
+    assert_eq!(flight.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(flight.pair.stats(Server).authentication_drops, 0);
+    assert!(!flight.pair.conn(Server).is_closed());
+    Ok(())
+}
+
+/// Even a first phase receipt from a foreign tuple starts the unchanged absolute cap.
+#[test]
+fn key_retention_first_offroute_packet_starts_cap() -> TestResult {
+    let mut cfg = TransportConfig::default();
+    cfg.max_idle_timeout(None);
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(cfg)
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let key = &mut pair.conn_mut(Server).packet_keys_for_test().remote;
+    let dropped = observe(key, u64::MAX, None);
+    pair.force_key_update(Client);
+    let rebound = pair.routes.as_basic_mut().passive_migration(Client);
+    pair.datagrams(Client)
+        .send(Bytes::from_static(b"first phase packet"), false)?;
+    pair.drive_client();
+    pair.drive_server();
+    let first = pair.time;
+    assert_eq!(pair.network_path(Server, PathId::ZERO)?.remote, rebound);
+    assert_eq!(
+        pair.datagrams(Server).recv().unwrap(),
+        b"first phase packet"[..]
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    // Withhold every subsequent packet, so only the absolute cap can release the keys.
+    let cap = first + Duration::from_secs(30);
+    pair.time = cap;
+    pair.conn_mut(Server).handle_timeout(cap);
+    assert!(!pair.conn(Server).is_closed());
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "first off-route phase receipt did not start the absolute cap"
     );
     Ok(())
 }
