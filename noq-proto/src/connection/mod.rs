@@ -4307,10 +4307,12 @@ impl Connection {
         pns.loss_time = None;
         pns.loss_probes = 0;
         let sent_packets = mem::take(&mut pns.sent_packets);
-        let path = self
-            .paths
-            .get_mut(&PathId::ZERO)
-            .expect("PathId::ZERO is alive while Initial/Handshake spaces exist");
+        // Initial and Handshake packets only travel on PathId::ZERO. A multipath client can
+        // abandon and discard that path before HANDSHAKE_DONE arrives; its in-flight and loss
+        // state went with it, so only the keys and sent packets are left to drop.
+        let Some(path) = self.paths.get_mut(&PathId::ZERO) else {
+            return;
+        };
         for (_, packet) in sent_packets.into_iter() {
             path.data.remove_in_flight(&packet);
         }
@@ -4799,7 +4801,7 @@ impl Connection {
                 for (_, info) in zero_rtt.into_iter() {
                     self.paths
                         .get_mut(&PathId::ZERO)
-                        .unwrap()
+                        .expect("Handshake state: no path can be abandoned before multipath")
                         .remove_in_flight(&info);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
@@ -4924,7 +4926,7 @@ impl Connection {
                     let mut state = state.clone();
                     self.remote_cids
                         .get_mut(&path_id)
-                        .expect("PathId::ZERO not yet abandoned")
+                        .expect("Handshake state: no path can be abandoned before multipath")
                         .update_initial_cid(remote_cid);
                     self.remote_handshake_cid = remote_cid;
                     self.original_remote_cid = remote_cid;
@@ -6184,7 +6186,7 @@ impl Connection {
         if self
             .local_cid_state
             .get(&PathId::ZERO)
-            .expect("PathId::ZERO exists when the connection is created")
+            .expect("only called in Handshake state, before any path can be abandoned")
             .cid_len()
             == 0
         {
@@ -6911,7 +6913,7 @@ impl Connection {
         trace!("negotiated max idle timeout {:?}", self.idle_timeout);
 
         if let Some(ref info) = params.preferred_address {
-            // During the handshake PathId::ZERO exists.
+            // Only called in Handshake state, before any path can be abandoned.
             self.remote_cids.get_mut(&PathId::ZERO).expect("not yet abandoned").insert(frame::NewConnectionId {
                 path_id: None,
                 sequence: 1,

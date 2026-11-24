@@ -18,6 +18,7 @@ use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamEvent, TransportErrorCode,
     n0_nat_traversal,
 };
+use crate::{ConnectionHandle, frame, shared::ConnectionEventInner};
 
 use super::util::{
     ConnPair, ManyToManyRouting, Pair, SimpleFirewallRouting, client_config, min_opt,
@@ -2637,5 +2638,112 @@ fn key_update_with_queued_old_phase(routes: super::util::MixedRouteRouting) -> T
     assert_eq!(path.lost_packets, 0);
     assert_eq!(received, LEN);
     assert!(ended);
+    Ok(())
+}
+
+/// One step of `pair` in which the client never processes a datagram carrying HANDSHAKE_DONE.
+fn step_withholding_handshake_done(pair: &mut Pair, client_ch: ConnectionHandle) -> bool {
+    pair.client.drive_incoming(pair.time);
+    let client = &mut pair.client;
+    let conn = &client.connections[&client_ch];
+    if let Some(events) = client.conn_events.get_mut(&client_ch) {
+        events.retain(|event| {
+            // Only Handshake packets get coalesced, and the server sends none once it has
+            // confirmed the handshake, so a coalesced datagram cannot carry HANDSHAKE_DONE.
+            let coalesced =
+                matches!(&event.0, ConnectionEventInner::Datagram(d) if d.remaining.is_some());
+            let payload = (!coalesced)
+                .then(|| conn.decode_packet(event))
+                .flatten()
+                .unwrap_or_default();
+            let done = frame::Iter::new(payload.into()).is_ok_and(|mut frames| {
+                frames.any(|frame| matches!(frame, Ok(frame::Frame::HandshakeDone)))
+            });
+            if done {
+                info!("withholding a datagram carrying HANDSHAKE_DONE from the client");
+            }
+            !done
+        });
+    }
+    pair.drive_client();
+    pair.drive_server();
+    pair.advance_time()
+}
+
+/// Regression (n0-computer/noq#904, from upstream fd36bc5b): a multipath client may abandon and
+/// discard path 0 after its handshake completes but before HANDSHAKE_DONE confirms it. Confirming
+/// the handshake afterwards, on another path, must not assume path 0 is still alive.
+#[test]
+fn handshake_confirmed_after_path_zero_discarded() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, client_cfg) = ConnPair::builder().enable_multipath().build_pair();
+    let client_addr = pair.routes.as_basic().client_addr;
+    let server_addr = pair.routes.as_basic().server_addr;
+    let (mut second_client_addr, mut second_server_addr) = (client_addr, server_addr);
+    second_client_addr.set_port(client_addr.port() + 1);
+    second_server_addr.set_port(server_addr.port() + 1);
+    pair.routes = ManyToManyRouting::simple_symmetric(
+        [client_addr, second_client_addr],
+        [server_addr, second_server_addr],
+    )
+    .into();
+
+    let client_ch = pair.begin_connect(client_cfg);
+    while pair.client.connections[&client_ch].is_handshaking()
+        || pair
+            .server
+            .connections
+            .values()
+            .any(|conn| conn.is_handshaking())
+    {
+        assert!(step_withholding_handshake_done(&mut pair, client_ch));
+    }
+    let server_ch = pair.server.assert_accept();
+    let mut pair = ConnPair::new(pair, client_ch, server_ch);
+    assert!(pair.is_multipath_negotiated(Client));
+
+    let second_path = FourTuple {
+        local_ip: Some(second_client_addr.ip()),
+        remote: second_server_addr,
+    };
+    let mut opened = pair.open_path(Client, second_path, PathStatus::Available);
+    for _ in 0..50 {
+        if opened.is_ok() {
+            break;
+        }
+        step_withholding_handshake_done(&mut pair, client_ch);
+        opened = pair.open_path(Client, second_path, PathStatus::Available);
+    }
+    let path_id = opened?;
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+
+    let mut discarded = false;
+    for _ in 0..500 {
+        while let Some(event) = pair.poll(Client) {
+            assert!(
+                !matches!(event, Event::HandshakeConfirmed),
+                "HANDSHAKE_DONE leaked"
+            );
+            discarded |=
+                matches!(event, Event::Path(PathEvent::Discarded { id, .. }) if id == PathId::ZERO);
+        }
+        if discarded || !step_withholding_handshake_done(&mut pair, client_ch) {
+            break;
+        }
+    }
+    assert!(
+        discarded,
+        "the client discards path 0 before its handshake is confirmed"
+    );
+    assert!(!pair.paths(Client).contains(&PathId::ZERO));
+    info!(%path_id, "path 0 discarded; releasing HANDSHAKE_DONE");
+
+    pair.drive();
+    let mut confirmed = false;
+    while let Some(event) = pair.poll(Client) {
+        confirmed |= matches!(event, Event::HandshakeConfirmed);
+    }
+    assert!(confirmed, "the handshake is confirmed after path 0 is gone");
+    assert!(!pair.is_closed(Client));
     Ok(())
 }
